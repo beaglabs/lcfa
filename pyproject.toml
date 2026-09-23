@@ -23,6 +23,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 
+[project.scripts]
+lcfa-bench = "lcfa.bench_cli:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
