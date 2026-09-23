@@ -1,6 +1,6 @@
 [profile]
 id = "education"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reference institutional intelligence profile for education state reasoning."
 
 [entities]
@@ -43,6 +43,26 @@ enable = [
   "core.recommend",
   "stats.mean",
   "stats.delta",
+  "temporal.window",
+  "temporal.slope",
+  "temporal.rolling_mean",
+  "temporal.change_point",
+  "hierarchy.expand",
+  "hierarchy.path",
+  "hierarchy.aggregate",
+  "cohort.compare",
+  "cohort.percentile",
+  "cohort.summarize",
+  "anomaly.robust_zscores",
+  "anomaly.outliers",
+  "anomaly.ewma",
+  "evidence.coverage",
+  "evidence.contradictions",
+  "evidence.require_coverage",
+  "constraints.check",
+  "constraints.require",
+  "constraints.filter",
+  "constraints.all",
 ]
 
 [actions]
