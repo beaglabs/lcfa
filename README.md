@@ -99,6 +99,38 @@ assert v1.identity.semantic_id == v2.identity.semantic_id
 assert v1.identity.content_hash != v2.identity.content_hash
 ```
 
+## Deterministic reasoning library
+
+LCFA-Zero ships a domain-neutral operator library that composes through `ReasoningPlan` without custom training:
+
+- `temporal.*` — windows, trend slopes, rolling means, and mean-shift change points
+- `hierarchy.*` — relationship traversal, shortest paths, and node-set aggregation
+- `cohort.*` — cohort summaries, comparisons, effect size, and percentile rank
+- `anomaly.*` — robust MAD z-scores, outlier detection, and EWMA smoothing
+- `evidence.*` — evidence-ID coverage, contradiction detection, and coverage requirements
+- `constraints.*` — typed checks, hard requirements, record filtering, and boolean conjunction
+
+Operators preserve inherited evidence by default, so a derived metric remains linked to the observations that produced it.
+
+```python
+plan = ReasoningPlan(
+    id="trajectory-analysis",
+    nodes=(
+        PlanNode("trend", "temporal.slope", {"values": "$state.scores"}),
+        PlanNode(
+            "guard",
+            "constraints.check",
+            {"lhs": "$node.trend", "rhs": 0},
+            {"op": "lt"},
+            depends_on=("trend",),
+        ),
+    ),
+    outputs=("trend", "guard"),
+)
+```
+
+These operators are intentionally deterministic baseline implementations. A future learned reasoner can target the same IR and be benchmarked against the same operator semantics.
+
 ## Minimal example
 
 ```python
@@ -142,20 +174,20 @@ pytest
 
 ## Near-term roadmap
 
-Completed in the initial runtime slice:
+Completed:
 
 - stable serialized LCFA IR for reasoning plans, solution state, action graphs, and traces
 - declarative profile loader
 - semantic-ID -> version -> BLAKE3 content-hash state-store contracts
 - reference education profile
+- deterministic temporal, hierarchy, cohort, anomaly, evidence, and constraint operator libraries
 
 Next:
 
-1. Deterministic temporal, hierarchy, cohort, anomaly, evidence, and constraint operator libraries.
-2. Benchmark harness shared by deterministic and learned reasoners.
-3. Optional artifact loader for `model.safetensors` and learned planner/reasoner backends.
-4. Durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
-5. Persistent state-store backends and CAS adapters.
+1. Benchmark harness shared by deterministic and learned reasoners.
+2. Optional artifact loader for `model.safetensors` and learned planner/reasoner backends.
+3. Durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
+4. Persistent state-store backends and CAS adapters.
 
 ## Status
 
