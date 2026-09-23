@@ -16,7 +16,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+  "blake3>=1.0",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
