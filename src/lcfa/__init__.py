@@ -2,6 +2,7 @@
 
 from .actions import RecommendationActionCompiler
 from .engine import LCFA
+from .operator_lib import ConstraintViolation, register_reasoning_operators
 from .operators import register_core_operators
 from .profile import Profile, ProfileError, load_profile
 from .protocol import (
@@ -53,6 +54,7 @@ __all__ = [
     "ActionResult",
     "ActionRun",
     "ActionSpec",
+    "ConstraintViolation",
     "EntityRef",
     "EvidenceRef",
     "EvidenceValue",
@@ -89,5 +91,6 @@ __all__ = [
     "load_profile",
     "loads_ir",
     "register_core_operators",
+    "register_reasoning_operators",
     "to_ir_dict",
 ]
