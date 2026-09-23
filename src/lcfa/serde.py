@@ -45,6 +45,7 @@ _KIND_BY_TYPE = {
     p.SolutionState: "solution_state",
     p.ActionGraph: "action_graph",
     p.ExecutionTrace: "execution_trace",
+    p.ExecutionContext: "execution_context",
 }
 
 
