@@ -1,0 +1,53 @@
+[profile]
+id = "education"
+version = "0.1.0"
+description = "Reference institutional intelligence profile for education state reasoning."
+
+[entities]
+types = [
+  "institution",
+  "college",
+  "department",
+  "program",
+  "course",
+  "section",
+  "student",
+  "instructor",
+  "advisor",
+  "assessment",
+  "enrollment",
+  "attendance_event",
+  "lms_activity",
+  "advising_event",
+  "intervention",
+  "metric",
+  "budget",
+  "purchase",
+  "forecast",
+]
+
+[relations]
+types = [
+  "belongs_to",
+  "enrolled_in",
+  "instructed_by",
+  "advised_by",
+  "observed_for",
+  "intervened_on",
+]
+
+[operators]
+enable = [
+  "core.identity",
+  "core.finding",
+  "core.recommend",
+  "stats.mean",
+  "stats.delta",
+]
+
+[actions]
+enable = []
+
+[metadata]
+domain = "education"
+state_model = "institutional"
