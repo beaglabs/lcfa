@@ -1,10 +1,11 @@
-"""Small training-free operator set used by LCFA-Zero and examples."""
+"""Training-free operator registration used by LCFA-Zero and examples."""
 
 from __future__ import annotations
 
 from statistics import fmean
 from typing import Mapping
 
+from .operator_lib import register_reasoning_operators
 from .protocol import ExecutionContext, Finding, OperatorResult, Recommendation
 from .registry import OperatorRegistry, OperatorSpec
 
@@ -67,4 +68,5 @@ def register_core_operators(registry: OperatorRegistry) -> OperatorRegistry:
     registry.register(OperatorSpec("stats.delta", _delta))
     registry.register(OperatorSpec("core.finding", _finding))
     registry.register(OperatorSpec("core.recommend", _recommend))
+    register_reasoning_operators(registry)
     return registry
