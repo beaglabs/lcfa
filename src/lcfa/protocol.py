@@ -76,6 +76,7 @@ class ReasoningPlan:
     nodes: tuple[PlanNode, ...]
     outputs: tuple[str, ...]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    schema_version: str = "lcfa.plan.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,7 @@ class TraceStep:
 class ExecutionTrace:
     plan_id: str
     steps: tuple[TraceStep, ...]
+    schema_version: str = "lcfa.trace.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,7 @@ class SolutionState:
     evidence: tuple[EvidenceRef, ...] = ()
     trace: ExecutionTrace | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    schema_version: str = "lcfa.solution.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +129,7 @@ class ActionGraph:
     source_solution_id: str
     nodes: tuple[ActionNode, ...]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    schema_version: str = "lcfa.action_graph.v1"
 
 
 @dataclass(frozen=True, slots=True)
