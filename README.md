@@ -47,7 +47,7 @@ observations -> next reasoning pass
 
 ## Stable LCFA IR
 
-Reasoning plans, solution states, action graphs, and execution traces can be serialized through the versioned `lcfa.ir.v1` JSON envelope.
+Reasoning plans, solution states, action graphs, execution contexts, and execution traces can be serialized through the versioned `lcfa.ir.v1` JSON envelope.
 
 ```python
 from lcfa import dumps_ir, loads_ir
@@ -131,6 +131,61 @@ plan = ReasoningPlan(
 
 These operators are intentionally deterministic baseline implementations. A future learned reasoner can target the same IR and be benchmarked against the same operator semantics.
 
+## LCFA-Bench
+
+`LCFA-Bench` is the shared comparison layer for deterministic and learned reasoners. A benchmark suite contains the exact `ReasoningPlan`, `ExecutionContext`, expected solution values, evidence expectations, and tags. Every backend is evaluated against the same serialized `lcfa.bench.v1` suite.
+
+Metrics currently include:
+
+- case pass rate and assertion accuracy
+- evidence precision, recall, and F1
+- wall-clock mean / p50 / p95 latency
+- replay determinism over repeated semantic `SolutionState` outputs
+- backend error rate
+- mean trace-step count
+- per-tag summaries for capability-level analysis
+
+Random solution IDs and trace timing are excluded from replay comparison; semantic values, findings, recommendations, evidence IDs, and solution metadata are compared.
+
+```python
+from lcfa import (
+    BenchmarkCase,
+    BenchmarkRunner,
+    BenchmarkSuite,
+    ExpectedValue,
+    ReasonerSubject,
+)
+
+suite = BenchmarkSuite(
+    id="my-suite",
+    cases=(
+        BenchmarkCase(
+            id="delta",
+            plan=plan,
+            context=context,
+            expectations=(ExpectedValue("values.delta", -8.0, abs_tol=1e-9),),
+            expected_evidence_ids=("obs:current", "obs:baseline"),
+            tags=("numeric", "evidence"),
+        ),
+    ),
+)
+
+report = BenchmarkRunner(repeats=5, warmup=1).run(
+    ReasonerSubject.from_engine("lcfa-zero", LCFA()),
+    suite,
+)
+```
+
+Suites and reports are JSON-serializable. The CLI can run LCFA-Zero directly or load a custom backend factory:
+
+```bash
+lcfa-bench run suite.json --name lcfa-zero --repeats 5 -o zero.json
+lcfa-bench run suite.json --factory my_model:create_engine --name lcfa-250m -o learned.json
+lcfa-bench compare zero.json learned.json --baseline lcfa-zero -o comparison.json
+```
+
+Comparisons expose raw metrics and deltas from the selected baseline; they do not collapse unlike metrics into a single synthetic score.
+
 ## Minimal example
 
 ```python
@@ -176,19 +231,20 @@ pytest
 
 Completed:
 
-- stable serialized LCFA IR for reasoning plans, solution state, action graphs, and traces
+- stable serialized LCFA IR for reasoning plans, solution state, action graphs, contexts, and traces
 - declarative profile loader
 - semantic-ID -> version -> BLAKE3 content-hash state-store contracts
 - reference education profile
 - deterministic temporal, hierarchy, cohort, anomaly, evidence, and constraint operator libraries
+- LCFA-Bench shared comparison harness and CLI
 
 Next:
 
-1. Benchmark harness shared by deterministic and learned reasoners.
-2. Optional artifact loader for `model.safetensors` and learned planner/reasoner backends.
-3. Durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
-4. Persistent state-store backends and CAS adapters.
+1. Build larger reusable benchmark suites for retrieval, temporal reasoning, hierarchy, cohort, anomaly, evidence, and constraints.
+2. Add optional artifact loading for `model.safetensors` and learned planner/reasoner backends.
+3. Add the durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
+4. Add persistent state-store backends and CAS adapters.
 
 ## Status
 
-Pre-alpha. The current branch establishes the runtime contracts and deterministic executor; it is not yet a production security boundary.
+Pre-alpha. The current branch establishes the runtime contracts, deterministic executor, and comparison harness; it is not yet a production security boundary.
