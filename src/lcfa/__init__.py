@@ -3,6 +3,7 @@
 from .actions import RecommendationActionCompiler
 from .engine import LCFA
 from .operators import register_core_operators
+from .profile import Profile, ProfileError, load_profile
 from .protocol import (
     ActionGraph,
     ActionNode,
@@ -21,6 +22,27 @@ from .protocol import (
 )
 from .registry import ActionRegistry, ActionSpec, OperatorRegistry, OperatorSpec
 from .runtime import ActionExecutor, ActionPolicyError, PlanError, ReasoningExecutor
+from .serde import (
+    IR_FORMAT,
+    SerializationError,
+    dump_ir,
+    dumps_ir,
+    from_ir_dict,
+    load_ir,
+    loads_ir,
+    to_ir_dict,
+)
+from .state import (
+    MemoryStateStore,
+    StateConflictError,
+    StateIdentity,
+    StateNotFoundError,
+    StateSnapshot,
+    StateStore,
+    StateStoreError,
+    canonical_bytes,
+    content_hash,
+)
 
 __all__ = [
     "ActionExecutor",
@@ -36,16 +58,36 @@ __all__ = [
     "EvidenceValue",
     "ExecutionContext",
     "Finding",
+    "IR_FORMAT",
     "LCFA",
+    "MemoryStateStore",
     "OperatorRegistry",
     "OperatorResult",
     "OperatorSpec",
     "PlanError",
     "PlanNode",
+    "Profile",
+    "ProfileError",
     "ReasoningExecutor",
     "ReasoningPlan",
     "Recommendation",
     "RecommendationActionCompiler",
+    "SerializationError",
     "SolutionState",
+    "StateConflictError",
+    "StateIdentity",
+    "StateNotFoundError",
+    "StateSnapshot",
+    "StateStore",
+    "StateStoreError",
+    "canonical_bytes",
+    "content_hash",
+    "dump_ir",
+    "dumps_ir",
+    "from_ir_dict",
+    "load_ir",
+    "load_profile",
+    "loads_ir",
     "register_core_operators",
+    "to_ir_dict",
 ]
