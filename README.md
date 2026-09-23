@@ -45,6 +45,60 @@ observations -> next reasoning pass
 - **Replayable:** reasoning and action execution produce typed traces.
 - **Upgradeable:** future learned reasoners can implement the same `ReasoningPlan -> SolutionState` contract.
 
+## Stable LCFA IR
+
+Reasoning plans, solution states, action graphs, and execution traces can be serialized through the versioned `lcfa.ir.v1` JSON envelope.
+
+```python
+from lcfa import dumps_ir, loads_ir
+
+encoded = dumps_ir(plan)
+restored = loads_ir(encoded)
+assert restored == plan
+```
+
+The protocol artifacts themselves carry schema versions such as `lcfa.plan.v1`, `lcfa.solution.v1`, and `lcfa.action_graph.v1`. This keeps the persisted execution format independent from whichever planner or reasoner produced it.
+
+## Declarative profiles
+
+Domain behavior belongs in profiles rather than the LCFA core. Profiles declare entity/relation vocabularies and the operators/actions they expect.
+
+```python
+from lcfa import LCFA
+
+engine = LCFA.from_profile("profiles/education")
+assert engine.profile.id == "education"
+```
+
+`profiles/education/profile.toml` is the first reference profile; education-specific entity types do not leak into the core runtime.
+
+## Semantic state identity
+
+LCFA separates logical identity from immutable content identity:
+
+```text
+semantic ID
+    |
+    v
+snapshot version
+    |
+    v
+BLAKE3(canonical payload)
+```
+
+`MemoryStateStore` is the reference implementation. Production backends can implement the same `StateStore` protocol with SQLite/libSQL, LMDB, RocksDB, object storage, or another persistence layer.
+
+```python
+from lcfa import MemoryStateStore
+
+store = MemoryStateStore()
+v1 = store.put("student:123", {"gpa": 3.2})
+v2 = store.put("student:123", {"gpa": 3.4}, expected_version=1)
+
+assert v1.identity.semantic_id == v2.identity.semantic_id
+assert v1.identity.content_hash != v2.identity.content_hash
+```
+
 ## Minimal example
 
 ```python
@@ -88,14 +142,21 @@ pytest
 
 ## Near-term roadmap
 
-1. Stable serialized LCFA IR for reasoning plans, solution state, action graphs, and traces.
-2. Profile loader for domain ontologies, policies, operators, and action builders.
-3. State-store interfaces with semantic UUID -> version -> content-hash identity.
-4. Deterministic temporal, hierarchy, cohort, anomaly, evidence, and constraint operator libraries.
-5. Benchmark harness shared by deterministic and learned reasoners.
-6. Optional artifact loader for `model.safetensors` and learned planner/reasoner backends.
-7. Durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
+Completed in the initial runtime slice:
+
+- stable serialized LCFA IR for reasoning plans, solution state, action graphs, and traces
+- declarative profile loader
+- semantic-ID -> version -> BLAKE3 content-hash state-store contracts
+- reference education profile
+
+Next:
+
+1. Deterministic temporal, hierarchy, cohort, anomaly, evidence, and constraint operator libraries.
+2. Benchmark harness shared by deterministic and learned reasoners.
+3. Optional artifact loader for `model.safetensors` and learned planner/reasoner backends.
+4. Durable state-propagation loop: `SolutionState -> ActionGraph -> observations -> SolutionState'`.
+5. Persistent state-store backends and CAS adapters.
 
 ## Status
 
-Pre-alpha. The current branch establishes the runtime contracts and first deterministic executor; it is not yet a production security boundary.
+Pre-alpha. The current branch establishes the runtime contracts and deterministic executor; it is not yet a production security boundary.
