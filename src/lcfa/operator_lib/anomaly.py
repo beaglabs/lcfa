@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from math import inf
 from statistics import median
 from typing import Mapping
 
@@ -16,7 +15,13 @@ def _robust_scores(values: list[float]) -> list[float]:
     deviations = [abs(value - center) for value in values]
     mad = median(deviations)
     if mad == 0:
-        return [0.0 if value == center else (inf if value > center else -inf) for value in values]
+        positive = sorted(deviation for deviation in deviations if deviation > 0)
+        if not positive:
+            return [0.0 for _ in values]
+        # When a majority of observations are identical, the conventional MAD is
+        # zero. Use the smallest observed non-zero deviation as a conservative
+        # local scale rather than treating every deviation as infinite.
+        mad = positive[0]
     scale = 1.4826 * mad
     return [(value - center) / scale for value in values]
 
