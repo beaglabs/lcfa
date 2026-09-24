@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from safetensors import safe_open
 
-from lcfa.latent_encode import _write_part, encode_examples
+from lcfa.latent_encode import _dataset_fingerprint, _write_part, encode_examples
 from lcfa.latent_train import TextLatentExample
 from lcfa.zplug import LatentPacket, Observation, ZContext, ZPlugManifest, _rounded_pad_length
 
 
 class _BatchPlug:
-    def __init__(self) -> None:
+    def __init__(self, *, pad_to: int = 32) -> None:
         self.calls: list[int] = []
         self.manifest = ZPlugManifest(
             id="test.batch",
             version="1.0.0",
             modalities=("text",),
             capabilities=("encode:text", "encode-batch:text"),
+            metadata={"pad_to": pad_to, "max_tokens": 1024},
         )
 
     def _packet(self, observation: Observation) -> LatentPacket:
@@ -76,6 +78,8 @@ def test_encode_examples_batches_student_and_teacher_and_finalizes(tmp_path) -> 
         teacher = np.asarray(handle.get_tensor("teacher"))
     assert metadata["count"] == "5"
     assert metadata["encode_batch_size"] == "2"
+    assert metadata["zplug_fingerprint"]
+    assert metadata["dataset_fingerprint"] == _dataset_fingerprint(examples)
     assert student.shape == (5, 3)
     assert teacher.shape == (5, 3)
     assert np.all(teacher[:, 0] > student[:, 0])
@@ -93,6 +97,34 @@ def test_completed_feature_cache_is_reused_without_reencoding(tmp_path) -> None:
     assert second.calls == []
 
 
+def test_completed_cache_is_not_reused_when_encoder_configuration_changes(tmp_path) -> None:
+    output = tmp_path / "features.safetensors"
+    examples = _examples(3)
+    first = _BatchPlug(pad_to=32)
+    encode_examples(examples, first, output, batch_size=2, checkpoint_every=2)
+
+    second = _BatchPlug(pad_to=512)
+    encode_examples(examples, second, output, batch_size=2, checkpoint_every=2, resume=True)
+    assert second.calls != []
+
+
+def test_completed_cache_is_not_reused_when_dataset_content_changes(tmp_path) -> None:
+    output = tmp_path / "features.safetensors"
+    examples = _examples(3)
+    first = _BatchPlug()
+    encode_examples(examples, first, output, batch_size=2, checkpoint_every=2)
+
+    changed = list(examples)
+    changed[0] = TextLatentExample(
+        id=examples[0].id,
+        student_text="different masked content",
+        teacher_text=examples[0].teacher_text,
+    )
+    second = _BatchPlug()
+    encode_examples(tuple(changed), second, output, batch_size=2, checkpoint_every=2, resume=True)
+    assert second.calls != []
+
+
 def test_partial_checkpoint_resumes_at_next_unfinished_example(tmp_path) -> None:
     output = tmp_path / "features.safetensors"
     parts = tmp_path / "features.safetensors.parts"
@@ -107,6 +139,7 @@ def test_partial_checkpoint_resumes_at_next_unfinished_example(tmp_path) -> None
         student=[np.array([1, 2, 3], dtype=np.float32), np.array([4, 5, 6], dtype=np.float32)],
         teacher=[np.array([7, 8, 9], dtype=np.float32), np.array([10, 11, 12], dtype=np.float32)],
         zplug=plug,
+        dataset_fingerprint=_dataset_fingerprint(examples),
     )
 
     encode_examples(examples, plug, output, batch_size=2, checkpoint_every=2, resume=True)
@@ -118,3 +151,25 @@ def test_partial_checkpoint_resumes_at_next_unfinished_example(tmp_path) -> None
     assert student.shape == (5, 3)
     assert np.allclose(student[0], [1, 2, 3])
     assert np.allclose(student[1], [4, 5, 6])
+
+
+def test_partial_checkpoint_rejects_changed_encoder_configuration(tmp_path) -> None:
+    output = tmp_path / "features.safetensors"
+    parts = tmp_path / "features.safetensors.parts"
+    parts.mkdir()
+    examples = _examples(3)
+    original = _BatchPlug(pad_to=32)
+
+    _write_part(
+        parts,
+        start=0,
+        ids=[examples[0].id],
+        student=[np.array([1, 2, 3], dtype=np.float32)],
+        teacher=[np.array([4, 5, 6], dtype=np.float32)],
+        zplug=original,
+        dataset_fingerprint=_dataset_fingerprint(examples),
+    )
+
+    changed = _BatchPlug(pad_to=512)
+    with pytest.raises(ValueError, match="encoder configuration mismatch"):
+        encode_examples(examples, changed, output, batch_size=2, checkpoint_every=2, resume=True)
