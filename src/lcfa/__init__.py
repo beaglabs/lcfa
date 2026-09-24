@@ -32,6 +32,7 @@ from .bench import (
     loads_benchmark_report,
     loads_benchmark_suite,
 )
+from .bench_corpus import all_suites, suite_by_id
 from .engine import LCFA
 from .operator_lib import ConstraintViolation, register_reasoning_operators
 from .operators import register_core_operators
@@ -128,6 +129,7 @@ __all__ = [
     "StateSnapshot",
     "StateStore",
     "StateStoreError",
+    "all_suites",
     "benchmark_report_from_dict",
     "benchmark_report_to_dict",
     "benchmark_suite_from_dict",
@@ -152,5 +154,6 @@ __all__ = [
     "loads_ir",
     "register_core_operators",
     "register_reasoning_operators",
+    "suite_by_id",
     "to_ir_dict",
 ]
