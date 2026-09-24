@@ -146,6 +146,17 @@ def _mlx_batch_indices(mx: Any, indices: Sequence[int] | np.ndarray) -> Any:
     return mx.array(values.tolist(), dtype=mx.int32)
 
 
+def _variance_hinge_loss(ops: Any, representation: Any, *, epsilon: float = 1e-4) -> Any:
+    """VICReg-style variance hinge on the pre-normalized encoder representation.
+
+    `ops` is MLX at runtime and NumPy in contract tests. Keeping this small
+    primitive backend-agnostic makes the anti-collapse geometry directly testable
+    without requiring Apple MLX in Linux CI.
+    """
+    std = ops.sqrt(ops.var(representation, axis=0) + epsilon)
+    return ops.mean(ops.maximum(ops.array(0.0), ops.array(1.0) - std))
+
+
 def train_mlx_latent_predictor(
     feature_cache: str | Path,
     output_dir: str | Path,
@@ -225,8 +236,7 @@ def train_mlx_latent_predictor(
         # not on the unit-normalized prediction latent z. Applying a unit-std
         # hinge to z is mathematically incompatible with ||z||_2 = 1 and
         # creates a dimension-dependent artificial loss floor.
-        std = mx.sqrt(mx.var(representation, axis=0) + 1e-4)
-        variance_loss = mx.mean(mx.maximum(mx.array(0.0), mx.array(1.0) - std))
+        variance_loss = _variance_hinge_loss(mx, representation)
         total_loss = prediction_loss + float(variance_weight) * variance_loss
         return total_loss, prediction_loss, variance_loss
 
