@@ -21,6 +21,14 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[test]'
+      - name: Smoke-check installed CLIs
+        run: |
+          lcfa-bench --help >/dev/null
+          lcfa-bench-mixed --help >/dev/null
+          lcfa-latent --help >/dev/null
+          printf 'LCFA latent training example\n' > /tmp/lcfa-corpus.txt
+          lcfa-latent prepare /tmp/lcfa-corpus.txt --mask-ratio 0.25 --seed 7 -o /tmp/lcfa-latent.jsonl
+          test -s /tmp/lcfa-latent.jsonl
       - run: pytest
       - name: Benchmark reference safetensors artifact
         run: |
