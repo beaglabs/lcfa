@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from lcfa import ARTIFACT_FORMAT, BackboneSample, BenchmarkRunner, BenchmarkSuite, EvidenceRef, EvidenceValue, ExecutionContext, LCFA, PlanNode, ReasonerSubject, ReasoningPlan, STOCHASTIC_FLOW_ARCHITECTURE, StochasticFlowReasoner, all_suites, load_artifact_manifest, load_artifact_reasoner
+from lcfa import ARTIFACT_FORMAT, BackboneSample, BenchmarkRunner, BenchmarkSuite, EvidenceRef, EvidenceValue, ExecutionContext, LCFA, NullFastPrior, PlanNode, ReasonerSubject, ReasoningPlan, STOCHASTIC_FLOW_ARCHITECTURE, StochasticFlowReasoner, all_suites, load_artifact_manifest, load_artifact_reasoner
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / "artifacts" / "lcfa-stochastic-flow-reference"
@@ -52,7 +52,7 @@ def test_reference_stochastic_artifact_loads() -> None:
 def test_stochastic_flow_can_call_pure_operator_and_return_language() -> None:
     manifest = load_artifact_manifest(REFERENCE)
     reasoner = StochasticFlowReasoner(manifest, weights_path=REFERENCE / "model.safetensors",
-                                      backbone=ScriptedBackbone(), base_engine=LCFA())
+                                      backbone=ScriptedBackbone(), fast_prior=NullFastPrior(), base_engine=LCFA())
     plan = ReasoningPlan(id="stochastic-mean", metadata={"query": "What is the mean?"},
         nodes=(PlanNode("mean", "stats.mean", {"values": "$state.values"}),), outputs=("mean",))
     context = ExecutionContext(state={"values": EvidenceValue([1.0, 3.0], (EvidenceRef("obs:values"),))})

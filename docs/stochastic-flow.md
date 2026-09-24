@@ -1,8 +1,8 @@
 # `lcfa.stochastic-flow.v1`
 
-`lcfa.stochastic-flow.v1` is LCFA's probabilistic reasoning backend for a frozen pretrained language model.
+`lcfa.stochastic-flow.v1` is LCFA's probabilistic reasoning backend for a frozen pretrained language model with optional session-scoped fast parametric adaptation.
 
-It keeps one invariant: the language model may propose, branch, critique, and choose tools, but LCFA's typed state and pure operators remain the authoritative computational substrate.
+The language model may propose, branch, critique, and choose pure tools, but LCFA's typed state and operators remain the authoritative computational substrate.
 
 ```text
 ReasoningPlan + ExecutionContext
@@ -11,7 +11,7 @@ ReasoningPlan + ExecutionContext
         LCFA-Zero anchor
               |
               v
-      frozen LM backbone
+      configurable backbone
          /    |    \
  candidate candidate candidate
       |        |        |
@@ -19,19 +19,95 @@ ReasoningPlan + ExecutionContext
       \        |        /
        verifier/rerank
               |
+      fast parametric prior
+       observe -> update
+              |
           next step
               |
           SolutionState
 ```
 
-The stochastic backend currently preserves the anchor's `values`, `findings`, `recommendations`, and evidence semantics. The selected model answer is exposed at:
+The selected model answer is exposed at `solution.metadata["language"]`; the complete candidate/adaptation trace is under `solution.metadata["stochastic_flow"]`.
 
-```python
-solution.metadata["language"]
-solution.metadata["stochastic_flow"]
+## Backends
+
+Backbone selection is independent from LCFA flow logic:
+
+- `transformers-local` — local Hugging Face/PyTorch causal LM.
+- `mlx-local` — Apple-Silicon-native `mlx-lm` model.
+- `llama-cpp` — local GGUF through `llama-cpp-python`.
+- `reference` — CI-only deterministic fixture, rejected unless the artifact is marked `reference_only`.
+
+Example artifact configuration for an 8 GB Apple-Silicon Mac:
+
+```json
+{
+  "backbone": {
+    "type": "mlx-local",
+    "path": "/models/my-mlx-3b",
+    "max_input_tokens": 8192
+  },
+  "adaptation": {
+    "type": "mlx-fast",
+    "learning_rate": 0.08,
+    "decay": 0.999,
+    "score_weight": 0.5
+  },
+  "flow": {
+    "branches": 2,
+    "beam_width": 2,
+    "min_steps": 1,
+    "max_steps": 4,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "max_new_tokens": 384
+  }
+}
 ```
 
-Generated language therefore cannot silently replace trusted numeric/operator outputs.
+Install the Apple-native extras with:
+
+```bash
+pip install -e '.[mac]'
+```
+
+Runtime overrides do not require editing the artifact:
+
+```bash
+lcfa-bench run builtin:all \
+  --artifact artifacts/my-flow \
+  --backbone-type mlx-local \
+  --backbone-path /models/my-mlx-model \
+  --adaptation-type mlx-fast \
+  --adaptation-learning-rate 0.08 \
+  --prior-snapshot /tmp/lcfa-prior.safetensors
+```
+
+A CPU/GGUF run can instead use:
+
+```bash
+lcfa-bench run builtin:all \
+  --artifact artifacts/my-flow \
+  --backbone-type llama-cpp \
+  --backbone-path /models/model.gguf \
+  --n-ctx 8192 \
+  --n-threads 8 \
+  --n-gpu-layers 0
+```
+
+## Fast parametric priors
+
+`config.adaptation.type` is independent of the semantic backbone:
+
+- `none` — fixed candidate scoring.
+- `numpy-fast` — tiny portable online prior using NumPy.
+- `mlx-fast` — the same session-scoped adaptation on MLX/unified memory.
+
+The current fast prior does **not** fine-tune the frozen language model. It learns a small candidate-ranking function over seven observable features: model logprob, confidence, evidence validity, tool success, parse validity, finality, and verifier score. After each reasoning step, the winning candidate provides a target; the prior updates immediately and changes subsequent branch ranking in the same run.
+
+This separation is deliberate: it is model-agnostic, cheap enough for small machines, and reversible. A later model-specific LoRA/adapter implementation can use the same adaptation interface to mutate selected backbone deltas without changing `ReasoningPlan -> SolutionState`.
+
+Each independent `reason(...)` call resets the session prior by default. When `--prior-snapshot` or `adaptation.snapshot_path` is set, the final prior is written as `lcfa.fast-prior.v1` safetensors containing `prior.weights` and `prior.bias`.
 
 ## Candidate schema
 
@@ -46,11 +122,7 @@ Generated language therefore cannot silently replace trusted numeric/operator ou
 }
 ```
 
-`rationale` is an explicit answer artifact, not hidden chain-of-thought. The runtime does not request or persist private reasoning traces.
-
-## Test-time compute
-
-Artifacts control branch count, beam width, min/max reasoning steps, temperature, top-p, generation length, and verifier top-k. Harder deployments can spend more inference compute without changing the public LCFA contract.
+`rationale` is an explicit answer artifact, not hidden chain-of-thought.
 
 ## Tool safety
 
@@ -58,20 +130,6 @@ Only operators matching `config.tools.allowed` may be invoked. Stochastic reason
 
 ## Safetensors scoring
 
-The LCFA artifact's `model.safetensors` contains scalar scoring weights:
+The LCFA flow artifact's `model.safetensors` contains scalar scoring weights such as `score.logprob`, `score.confidence`, `score.evidence`, `score.tool`, `score.parse`, `score.final`, and `score.verifier`. A pretrained backbone may independently use its own safetensors/sharded-safetensors or GGUF representation.
 
-- `score.logprob`
-- `score.confidence`
-- `score.evidence`
-- `score.tool`
-- `score.parse`
-- `score.final`
-- `score.verifier`
-
-They combine model transition log probability, declared confidence, evidence validity, tool success, JSON validity, finality, and verifier judgment. They can later be analytically chosen, closed-form fit, or trained without changing the runtime.
-
-## Backbone
-
-The production adapter loads a local Hugging Face causal-LM directory lazily. The large pretrained checkpoint can therefore be swapped independently of the LCFA flow artifact.
-
-The existing 17-case corpus is a semantic regression suite, not a SOTA-reasoning benchmark. A quality corpus should add ambiguous retrieval, noisy/partial evidence, multi-hop planning, long context, uncertainty, operation selection, and open-ended explanation.
+The built-in 17-case corpus remains a semantic regression suite, not a SOTA-reasoning benchmark.
