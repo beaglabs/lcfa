@@ -180,21 +180,27 @@ def _mlx_array_to_float32_numpy(mx: Any, value: Any) -> np.ndarray:
     try:
         return np.array(value32, dtype=np.float32)
     except (RuntimeError, TypeError, ValueError):
-        # Older MLX/Python combinations can still reject the buffer view. The
-        # list fallback intentionally avoids the buffer protocol entirely.
         return np.asarray(value32.tolist(), dtype=np.float32)
+
+
+def _rounded_pad_length(length: int, *, pad_to: int, max_tokens: int) -> int:
+    """Round a sequence length up to a stable bucket without exceeding max_tokens."""
+    length = max(1, min(int(length), int(max_tokens)))
+    pad_to = max(1, int(pad_to))
+    rounded = ((length + pad_to - 1) // pad_to) * pad_to
+    return min(int(max_tokens), max(length, rounded))
 
 
 class MLXTextZPlug:
     """Frozen local MLX-LM hidden-state text enricher.
 
-    The implementation intentionally reads the final hidden state before the LM
-    head (`model.model(tokens)`) and pools it. This keeps generation out of the
-    latent path: the backbone acts as a semantic feature source, not the reasoner.
+    Hidden-state extraction supports right-padded batches. Padding is rounded to
+    a small fixed bucket size to reduce Metal graph shape churn during large
+    feature-cache jobs. Generation remains entirely outside this path.
     """
 
     def __init__(self, model_path: str | Path, *, max_tokens: int = 2048,
-                 pool: str = "last", normalize: bool = True,
+                 pool: str = "last", normalize: bool = True, pad_to: int = 32,
                  plug_id: str = "lcfa.text.mlx-hidden") -> None:
         try:
             import mlx.core as mx
@@ -211,17 +217,19 @@ class MLXTextZPlug:
             raise ValueError("MLX text zplug pool must be 'last' or 'mean'")
         self.pool = pool
         self.normalize = bool(normalize)
+        self.pad_to = max(1, int(pad_to))
         hidden_size = int(getattr(getattr(self.model, "args", None), "hidden_size", 0) or 0)
         self.manifest = ZPlugManifest(
             id=plug_id,
-            version="1.0.0",
+            version="1.1.0",
             modalities=("text",),
-            capabilities=("encode:text", "enrich:text"),
+            capabilities=("encode:text", "encode-batch:text", "enrich:text"),
             metadata={
                 "backend": "mlx-lm-hidden",
                 "model_path": self.model_path,
                 "pool": self.pool,
                 "max_tokens": self.max_tokens,
+                "pad_to": self.pad_to,
                 "feature_dim": hidden_size or None,
                 "frozen": True,
             },
@@ -232,32 +240,66 @@ class MLXTextZPlug:
         ids = list(int(v) for v in encoded)
         return ids[-self.max_tokens:] or [0]
 
-    def encode(self, observation: Observation, context: ZContext) -> LatentPacket:
-        if observation.modality != "text":
+    def _pad_token_id(self) -> int:
+        value = getattr(self.tokenizer, "pad_token_id", None)
+        if value is None:
+            value = getattr(self.tokenizer, "eos_token_id", None)
+        return int(value if value is not None else 0)
+
+    def encode_batch(self, observations: Sequence[Observation],
+                     contexts: Sequence[ZContext] | None = None) -> tuple[LatentPacket, ...]:
+        if not observations:
+            return ()
+        if any(item.modality != "text" for item in observations):
             raise ZPlugError("MLXTextZPlug accepts only text observations")
-        ids = self._tokens(str(observation.payload))
-        tokens = self._mx.array([ids])
+        if contexts is None:
+            contexts = tuple(ZContext() for _ in observations)
+        if len(contexts) != len(observations):
+            raise ValueError("contexts must match observations length")
+
+        token_rows = [self._tokens(str(item.payload)) for item in observations]
+        lengths = [len(row) for row in token_rows]
+        pad_length = _rounded_pad_length(max(lengths), pad_to=self.pad_to, max_tokens=self.max_tokens)
+        padded = np.full((len(token_rows), pad_length), self._pad_token_id(), dtype=np.int32)
+        for row_index, ids in enumerate(token_rows):
+            used = ids[-pad_length:]
+            padded[row_index, :len(used)] = used
+            lengths[row_index] = len(used)
+
+        tokens = self._mx.array(padded, dtype=self._mx.int32)
         hidden = self.model.model(tokens)
-        vector = hidden[0, -1, :] if self.pool == "last" else self._mx.mean(hidden[0], axis=0)
-        arr = _mlx_array_to_float32_numpy(self._mx, vector)
-        if self.normalize:
-            norm = float(np.linalg.norm(arr))
-            if norm > 0:
-                arr /= norm
-        return LatentPacket(
-            id=f"{observation.id}:latent",
-            zplug_id=self.manifest.id,
-            modality="text",
-            features=tuple(float(v) for v in arr),
-            evidence_refs=observation.evidence,
-            timestamp=observation.timestamp,
-            metadata={
-                "token_count": len(ids),
-                "pool": self.pool,
-                "model_path": self.model_path,
-                "context_query": context.query,
-            },
-        )
+        self._mx.eval(hidden)
+
+        packets: list[LatentPacket] = []
+        for row_index, (observation, context, length) in enumerate(zip(observations, contexts, lengths)):
+            if self.pool == "last":
+                vector = hidden[row_index, length - 1, :]
+            else:
+                vector = self._mx.mean(hidden[row_index, :length, :], axis=0)
+            arr = _mlx_array_to_float32_numpy(self._mx, vector)
+            if self.normalize:
+                norm = float(np.linalg.norm(arr))
+                if norm > 0:
+                    arr /= norm
+            packets.append(LatentPacket(
+                id=f"{observation.id}:latent",
+                zplug_id=self.manifest.id,
+                modality="text",
+                features=tuple(float(v) for v in arr),
+                evidence_refs=observation.evidence,
+                timestamp=observation.timestamp,
+                metadata={
+                    "token_count": int(length),
+                    "padded_tokens": int(pad_length),
+                    "pool": self.pool,
+                    "model_path": self.model_path,
+                    "context_query": context.query,
+                },
+            ))
+        return tuple(packets)
+
+    def encode(self, observation: Observation, context: ZContext) -> LatentPacket:
+        return self.encode_batch((observation,), (context,))[0]
 
 
 def zplug_manifest_to_dict(manifest: ZPlugManifest) -> dict[str, Any]:
@@ -294,6 +336,6 @@ def load_zplug_manifest(path: str | Path) -> ZPlugManifest:
 __all__ = [
     "LATENT_PACKET_FORMAT", "ZPLUG_FORMAT", "HashTextZPlug", "LatentDelta", "LatentPacket",
     "MLXTextZPlug", "Observation", "OutputRequest", "ZContext", "ZPlug", "ZPlugError",
-    "ZPlugManifest", "ZPlugRegistry", "load_zplug_manifest", "zplug_manifest_from_dict",
-    "zplug_manifest_to_dict",
+    "ZPlugManifest", "ZPlugRegistry", "_rounded_pad_length", "load_zplug_manifest",
+    "zplug_manifest_from_dict", "zplug_manifest_to_dict",
 ]
