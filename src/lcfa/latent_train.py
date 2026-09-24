@@ -146,6 +146,17 @@ def _mlx_batch_indices(mx: Any, indices: Sequence[int] | np.ndarray) -> Any:
     return mx.array(values.tolist(), dtype=mx.int32)
 
 
+def _variance_hinge_loss(ops: Any, representation: Any, *, epsilon: float = 1e-4) -> Any:
+    """VICReg-style variance hinge on the pre-normalized encoder representation.
+
+    `ops` is MLX at runtime and NumPy in contract tests. Keeping this small
+    primitive backend-agnostic makes the anti-collapse geometry directly testable
+    without requiring Apple MLX in Linux CI.
+    """
+    std = ops.sqrt(ops.var(representation, axis=0) + epsilon)
+    return ops.mean(ops.maximum(ops.array(0.0), ops.array(1.0) - std))
+
+
 def train_mlx_latent_predictor(
     feature_cache: str | Path,
     output_dir: str | Path,
@@ -193,8 +204,13 @@ def train_mlx_latent_predictor(
             self.target_encoder.update(self.encoder.parameters())
             self.target_encoder.freeze()
 
+        def student_representation(self, x):
+            """Return the pre-normalized LCFA encoder representation h."""
+            return self.encoder(x)
+
         def student_latent(self, x):
-            return normalize(self.encoder(x))
+            """Return unit-normalized latent z used by prediction/dynamics."""
+            return normalize(self.student_representation(x))
 
         def predict(self, z):
             return normalize(self.dynamics[1](nn.gelu_approx(self.dynamics[0](z))))
@@ -203,20 +219,30 @@ def train_mlx_latent_predictor(
             return normalize(self.target_encoder(x))
 
         def __call__(self, x):
-            z = self.student_latent(x)
-            return z, self.predict(z)
+            representation = self.student_representation(x)
+            z = normalize(representation)
+            return representation, z, self.predict(z)
 
     model = LatentPredictor()
     mx.eval(model.parameters())
     optimizer = optim.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
 
-    def loss_fn(model, student_x, teacher_x):
-        z, prediction = model(student_x)
+    def loss_components(model, student_x, teacher_x):
+        representation, _z, prediction = model(student_x)
         target = mx.stop_gradient(model.target_latent(teacher_x))
         prediction_loss = mx.mean(mx.square(prediction - target))
-        std = mx.sqrt(mx.var(z, axis=0) + 1e-4)
-        variance_loss = mx.mean(mx.maximum(mx.array(0.0), mx.array(1.0) - std))
-        return prediction_loss + float(variance_weight) * variance_loss
+
+        # Anti-collapse acts on the encoder's unconstrained representation h,
+        # not on the unit-normalized prediction latent z. Applying a unit-std
+        # hinge to z is mathematically incompatible with ||z||_2 = 1 and
+        # creates a dimension-dependent artificial loss floor.
+        variance_loss = _variance_hinge_loss(mx, representation)
+        total_loss = prediction_loss + float(variance_weight) * variance_loss
+        return total_loss, prediction_loss, variance_loss
+
+    def loss_fn(model, student_x, teacher_x):
+        total_loss, _prediction_loss, _variance_loss = loss_components(model, student_x, teacher_x)
+        return total_loss
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
     student = mx.array(student_np)
@@ -247,6 +273,12 @@ def train_mlx_latent_predictor(
             last_loss = float(loss.item())
             if progress is not None:
                 progress(epoch + 1, max(1, int(epochs)), global_step, last_loss)
+
+    final_total, final_prediction, final_variance = loss_components(model, student, teacher)
+    mx.eval(final_total, final_prediction, final_variance)
+    final_loss = float(final_total.item())
+    final_prediction_loss = float(final_prediction.item())
+    final_variance_loss = float(final_variance.item())
 
     flat = tree_flatten(model.parameters(), destination={})
     required = (
@@ -297,7 +329,9 @@ def train_mlx_latent_predictor(
         },
         "metadata": {
             "training": {
-                "objective": "masked-latent-prediction+ema-target",
+                "objective": "masked-latent-prediction+ema-target+pre-norm-variance",
+                "prediction_space": "unit-normalized-latent",
+                "anti_collapse_space": "pre-normalized-encoder-representation",
                 "feature_cache": str(feature_cache),
                 "feature_cache_zplug": cache_metadata.get("zplug_id"),
                 "examples": count,
@@ -311,7 +345,10 @@ def train_mlx_latent_predictor(
                 "ema_decay": float(ema_decay),
                 "variance_weight": float(variance_weight),
                 "steps": global_step,
-                "final_loss": last_loss,
+                "final_loss": final_loss,
+                "final_prediction_loss": final_prediction_loss,
+                "final_variance_loss": final_variance_loss,
+                "last_minibatch_loss": last_loss,
                 "seed": int(seed),
             },
             "solution_decoder": "disabled-until-evaluated",
