@@ -1,0 +1,75 @@
+[profile]
+id = "education"
+version = "0.3.0"
+description = "Reference institutional intelligence profile for education state reasoning."
+
+[entities]
+types = [
+  "institution",
+  "college",
+  "department",
+  "program",
+  "course",
+  "section",
+  "student",
+  "instructor",
+  "advisor",
+  "assessment",
+  "enrollment",
+  "attendance_event",
+  "lms_activity",
+  "advising_event",
+  "intervention",
+  "metric",
+  "budget",
+  "purchase",
+  "forecast",
+]
+
+[relations]
+types = [
+  "belongs_to",
+  "enrolled_in",
+  "instructed_by",
+  "advised_by",
+  "observed_for",
+  "intervened_on",
+]
+
+[operators]
+enable = [
+  "core.identity",
+  "core.finding",
+  "core.recommend",
+  "stats.mean",
+  "stats.delta",
+  "retrieval.rank",
+  "retrieval.recall_at_k",
+  "temporal.window",
+  "temporal.slope",
+  "temporal.rolling_mean",
+  "temporal.change_point",
+  "hierarchy.expand",
+  "hierarchy.path",
+  "hierarchy.aggregate",
+  "cohort.compare",
+  "cohort.percentile",
+  "cohort.summarize",
+  "anomaly.robust_zscores",
+  "anomaly.outliers",
+  "anomaly.ewma",
+  "evidence.coverage",
+  "evidence.contradictions",
+  "evidence.require_coverage",
+  "constraints.check",
+  "constraints.require",
+  "constraints.filter",
+  "constraints.all",
+]
+
+[actions]
+enable = []
+
+[metadata]
+domain = "education"
+state_model = "institutional"

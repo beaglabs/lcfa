@@ -1,0 +1,64 @@
+{
+  "format": "lcfa.bench.corpus.v1",
+  "corpus": "lcfa-core",
+  "case_count": 17,
+  "suites": [
+    {
+      "id": "lcfa-core-retrieval",
+      "cases": [
+        "retrieval.rank-exact-domain-terms",
+        "retrieval.rank-multi-field"
+      ]
+    },
+    {
+      "id": "lcfa-core-temporal",
+      "cases": [
+        "temporal.linear-trend",
+        "temporal.change-point",
+        "temporal.window-inclusive"
+      ]
+    },
+    {
+      "id": "lcfa-core-hierarchy",
+      "cases": [
+        "hierarchy.expand-descendants",
+        "hierarchy.path-and-aggregate"
+      ]
+    },
+    {
+      "id": "lcfa-core-cohort",
+      "cases": [
+        "cohort.mean-shift-effect-size",
+        "cohort.percentile-and-summary"
+      ]
+    },
+    {
+      "id": "lcfa-core-anomaly",
+      "cases": [
+        "anomaly.robust-outlier",
+        "anomaly.ewma"
+      ]
+    },
+    {
+      "id": "lcfa-core-evidence",
+      "cases": [
+        "evidence.propagates-through-derived-delta",
+        "evidence.coverage-and-contradiction"
+      ]
+    },
+    {
+      "id": "lcfa-core-constraints",
+      "cases": [
+        "constraints.filter-and-check",
+        "constraints.compose-all"
+      ]
+    },
+    {
+      "id": "lcfa-core-end-to-end",
+      "cases": [
+        "end-to-end.trajectory-investigation",
+        "end-to-end.retrieve-then-analyze"
+      ]
+    }
+  ]
+}

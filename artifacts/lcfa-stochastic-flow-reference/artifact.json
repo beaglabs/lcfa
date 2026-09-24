@@ -1,0 +1,42 @@
+{
+  "architecture": "lcfa.stochastic-flow.v1",
+  "base_backend": "lcfa-zero",
+  "config": {
+    "backbone": {"type": "reference"},
+    "flow": {
+      "beam_width": 2,
+      "branches": 3,
+      "max_new_tokens": 256,
+      "max_steps": 2,
+      "min_steps": 1,
+      "seed": 7,
+      "temperature": 0.8,
+      "top_p": 0.95
+    },
+    "tools": {
+      "allowed": ["stats.*", "temporal.*", "cohort.*", "hierarchy.*", "anomaly.*", "evidence.*", "constraints.*", "retrieval.*"]
+    },
+    "verifier": {"enabled": true, "max_new_tokens": 24, "top_k": 2}
+  },
+  "format": "lcfa.artifact.v1",
+  "id": "lcfa-stochastic-flow-reference",
+  "metadata": {
+    "purpose": "CI-only stochastic-flow integration reference; not a quality benchmark.",
+    "reference_only": true
+  },
+  "tensors": {
+    "score.confidence": {"dtype": "F32", "shape": [1]},
+    "score.evidence": {"dtype": "F32", "shape": [1]},
+    "score.final": {"dtype": "F32", "shape": [1]},
+    "score.logprob": {"dtype": "F32", "shape": [1]},
+    "score.parse": {"dtype": "F32", "shape": [1]},
+    "score.tool": {"dtype": "F32", "shape": [1]},
+    "score.verifier": {"dtype": "F32", "shape": [1]}
+  },
+  "version": "0.1.0-reference",
+  "weights": {
+    "file": "model.safetensors",
+    "format": "safetensors",
+    "sha256": "9344e206d369b8b044b6932b097dbba326e724e4dc6b765afa28814d9af1b1de"
+  }
+}

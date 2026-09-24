@@ -1,0 +1,28 @@
+{
+  "format": "lcfa.artifact.v1",
+  "id": "lcfa-weighted-identity",
+  "version": "0.1.0",
+  "architecture": "lcfa.weighted-output.v1",
+  "base_backend": "lcfa-zero",
+  "weights": {
+    "file": "model.safetensors",
+    "format": "safetensors",
+    "sha256": "67b56646b0e2dd645342efeb3c68a799391ef5aa38b1c27797a3d9fa35c1996f"
+  },
+  "tensors": {
+    "numeric.scale": {
+      "shape": [1],
+      "dtype": "F32",
+      "semantics": "Affine scale applied to floating-point SolutionState values."
+    },
+    "numeric.bias": {
+      "shape": [1],
+      "dtype": "F32",
+      "semantics": "Affine bias applied to floating-point SolutionState values."
+    }
+  },
+  "metadata": {
+    "training": "none",
+    "purpose": "Reference identity-initialized artifact for validating the LCFA safetensors contract and benchmark path."
+  }
+}
