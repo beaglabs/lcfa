@@ -30,15 +30,15 @@ transformers = [
   "accelerate>=1.14",
 ]
 mlx = [
-  "mlx>=0.24",
-  "mlx-lm>=0.24",
+  "mlx>=0.32.2",
+  "mlx-lm>=0.31.3",
 ]
 llama-cpp = [
   "llama-cpp-python>=0.3",
 ]
 mac = [
-  "mlx>=0.24",
-  "mlx-lm>=0.24",
+  "mlx>=0.32.2",
+  "mlx-lm>=0.31.3",
 ]
 benchmarks = [
   "datasets>=3.0",

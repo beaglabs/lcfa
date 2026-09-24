@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from safetensors import safe_open
 
 from lcfa import (
@@ -12,6 +13,7 @@ from lcfa import (
     ZPlugRegistry,
 )
 from lcfa.latent_train import encode_examples, examples_from_lines
+from lcfa.zplug import _mlx_array_to_float32_numpy
 
 
 def test_hash_text_zplug_is_deterministic_and_normalized() -> None:
@@ -50,3 +52,24 @@ def test_text_dataset_can_be_masked_and_cached_without_neural_dependencies(tmp_p
         assert handle.metadata()["format"] == "lcfa.latent-features.v1"
         assert handle.get_tensor("student").shape == (2, 24)
         assert handle.get_tensor("teacher").shape == (2, 24)
+
+
+def test_mlx_hidden_conversion_casts_to_float32_before_numpy() -> None:
+    sentinel = object()
+
+    class FakeMX:
+        float32 = sentinel
+
+        @staticmethod
+        def eval(value) -> None:
+            assert isinstance(value, np.ndarray)
+            assert value.dtype == np.float32
+
+    class FakeArray:
+        def astype(self, dtype):
+            assert dtype is sentinel
+            return np.asarray([1.5, -2.0, 3.25], dtype=np.float32)
+
+    result = _mlx_array_to_float32_numpy(FakeMX, FakeArray())
+    assert result.dtype == np.float32
+    assert result.tolist() == [1.5, -2.0, 3.25]
