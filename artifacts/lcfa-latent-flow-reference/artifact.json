@@ -1,0 +1,35 @@
+{
+  "architecture": "lcfa.latent-flow.v1",
+  "base_backend": "lcfa-zero",
+  "config": {
+    "flow": {
+      "include_vector": false,
+      "steps": 3
+    },
+    "zplug": {
+      "feature_dim": 64,
+      "type": "hash-text"
+    }
+  },
+  "format": "lcfa.artifact.v1",
+  "id": "lcfa-latent-flow-reference",
+  "metadata": {
+    "purpose": "CI-only latent-flow/zplug contract fixture; not a quality model.",
+    "reference_only": true,
+    "solution_decoder": "disabled-until-evaluated"
+  },
+  "tensors": {
+    "dynamics.0.bias": {"dtype": "F32", "shape": [32]},
+    "dynamics.0.weight": {"dtype": "F32", "shape": [32, 16]},
+    "dynamics.1.bias": {"dtype": "F32", "shape": [16]},
+    "dynamics.1.weight": {"dtype": "F32", "shape": [16, 32]},
+    "encoder.bias": {"dtype": "F32", "shape": [16]},
+    "encoder.weight": {"dtype": "F32", "shape": [16, 64]}
+  },
+  "version": "0.1.0-reference",
+  "weights": {
+    "file": "model.safetensors",
+    "format": "safetensors",
+    "sha256": "191c1ff39e4f22c399467aacce5f564b07f15bb69e619201edf04b78d5ad58b5"
+  }
+}
