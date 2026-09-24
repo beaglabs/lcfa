@@ -58,3 +58,23 @@ jobs:
           assert summary["replay_determinism_rate"] == 1.0
           assert summary["evidence_f1"] == 1.0
           PY
+      - name: Benchmark reference latent-flow artifact
+        run: |
+          lcfa-bench run builtin:all \
+            --artifact artifacts/lcfa-latent-flow-reference \
+            --name lcfa-latent-flow-reference \
+            --repeats 2 \
+            -o latent-report.json
+          python - <<'PY'
+          import json
+          report = json.load(open("latent-report.json", encoding="utf-8"))
+          summary = report["summary"]
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          assert summary["case_count"] == 17
+          assert summary["case_pass_rate"] == 1.0
+          assert summary["assertion_accuracy"] == 1.0
+          assert summary["error_rate"] == 0.0
+          assert summary["replay_determinism_rate"] == 1.0
+          assert summary["evidence_f1"] == 1.0
+          assert report["subject_metadata"]["architecture"] == "lcfa.latent-flow.v1"
+          PY

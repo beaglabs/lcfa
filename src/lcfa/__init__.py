@@ -16,6 +16,9 @@ from .runtime import ActionExecutor, ActionPolicyError, PlanError, ReasoningExec
 from .serde import IR_FORMAT, SerializationError, dump_ir, dumps_ir, from_ir_dict, load_ir, loads_ir, to_ir_dict
 from .state import MemoryStateStore, StateConflictError, StateIdentity, StateNotFoundError, StateSnapshot, StateStore, StateStoreError, canonical_bytes, content_hash
 from .stochastic import FlowCandidate, FlowToolRequest, StochasticFlowReasoner
+from .zplug import LATENT_PACKET_FORMAT, ZPLUG_FORMAT, HashTextZPlug, LatentDelta, LatentPacket, MLXTextZPlug, Observation, OutputRequest, ZContext, ZPlug, ZPlugError, ZPlugManifest, ZPlugRegistry, load_zplug_manifest, zplug_manifest_from_dict, zplug_manifest_to_dict
+from .latent_flow import LATENT_FLOW_ARCHITECTURE, LATENT_STATE_FORMAT, LatentFlowReasoner, LatentState, NumpyLatentCore
+from . import latent_artifact as _latent_artifact
 
 # Keep mixed-benchmark helper bindings corrected for both CLI and direct imports.
 from . import bench_mixed_fixups as _bench_mixed_fixups
