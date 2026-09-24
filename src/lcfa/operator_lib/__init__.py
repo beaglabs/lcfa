@@ -8,10 +8,12 @@ from .cohort import register_cohort_operators
 from .constraints import ConstraintViolation, register_constraint_operators
 from .evidence import register_evidence_operators
 from .hierarchy import register_hierarchy_operators
+from .retrieval import register_retrieval_operators
 from .temporal import register_temporal_operators
 
 
 def register_reasoning_operators(registry: OperatorRegistry) -> OperatorRegistry:
+    register_retrieval_operators(registry)
     register_temporal_operators(registry)
     register_hierarchy_operators(registry)
     register_cohort_operators(registry)
