@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from safetensors import safe_open
 
-from lcfa.latent_encode import encode_examples
+from lcfa.latent_encode import _write_part, encode_examples
 from lcfa.latent_train import TextLatentExample
 from lcfa.zplug import LatentPacket, Observation, ZContext, ZPlugManifest, _rounded_pad_length
 
@@ -91,3 +91,30 @@ def test_completed_feature_cache_is_reused_without_reencoding(tmp_path) -> None:
     second = _BatchPlug()
     encode_examples(examples, second, output, batch_size=2, checkpoint_every=2, resume=True)
     assert second.calls == []
+
+
+def test_partial_checkpoint_resumes_at_next_unfinished_example(tmp_path) -> None:
+    output = tmp_path / "features.safetensors"
+    parts = tmp_path / "features.safetensors.parts"
+    parts.mkdir()
+    examples = _examples(5)
+    plug = _BatchPlug()
+
+    _write_part(
+        parts,
+        start=0,
+        ids=[examples[0].id, examples[1].id],
+        student=[np.array([1, 2, 3], dtype=np.float32), np.array([4, 5, 6], dtype=np.float32)],
+        teacher=[np.array([7, 8, 9], dtype=np.float32), np.array([10, 11, 12], dtype=np.float32)],
+        zplug=plug,
+    )
+
+    encode_examples(examples, plug, output, batch_size=2, checkpoint_every=2, resume=True)
+
+    # Only examples 2-4 are encoded: 2 examples => 4 sequences, then 1 => 2.
+    assert plug.calls == [4, 2]
+    with safe_open(str(output), framework="np", device="cpu") as handle:
+        student = np.asarray(handle.get_tensor("student"))
+    assert student.shape == (5, 3)
+    assert np.allclose(student[0], [1, 2, 3])
+    assert np.allclose(student[1], [4, 5, 6])
