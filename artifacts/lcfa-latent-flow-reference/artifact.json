@@ -30,6 +30,6 @@
   "weights": {
     "file": "model.safetensors",
     "format": "safetensors",
-    "sha256": "82fbe0ad0ec4858529f4f001561ceb0fe4290f86fa6df311910679cbfa637d47"
+    "sha256": "191c1ff39e4f22c399467aacce5f564b07f15bb69e619201edf04b78d5ad58b5"
   }
 }
