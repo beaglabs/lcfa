@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .bench import dumps_benchmark_report, dumps_benchmark_suite, load_benchmark_suite
 from .bench_cli import _ProgressPrinter, _subject_from_args
-from .bench_mixed import (
+from .bench_mixed_fixups import (
     DEFAULT_SEED,
     MIXED_PRESETS,
     MixedBenchmarkRunner,
