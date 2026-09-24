@@ -20,4 +20,7 @@ from .zplug import LATENT_PACKET_FORMAT, ZPLUG_FORMAT, HashTextZPlug, LatentDelt
 from .latent_flow import LATENT_FLOW_ARCHITECTURE, LATENT_STATE_FORMAT, LatentFlowReasoner, LatentState, NumpyLatentCore
 from . import latent_artifact as _latent_artifact
 
+# Keep mixed-benchmark helper bindings corrected for both CLI and direct imports.
+from . import bench_mixed_fixups as _bench_mixed_fixups
+
 __all__ = [name for name in globals() if not name.startswith("_")]
