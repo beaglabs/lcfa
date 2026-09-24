@@ -6,12 +6,11 @@ from pathlib import Path
 import sys
 from time import perf_counter
 
+from .latent_encode import encode_examples, make_mlx_text_zplug
 from .latent_train import (
     dump_examples_jsonl,
-    encode_examples,
     examples_from_lines,
     load_examples_jsonl,
-    make_mlx_text_zplug,
     train_mlx_latent_predictor,
 )
 
@@ -31,6 +30,14 @@ def _parser() -> argparse.ArgumentParser:
     encode.add_argument("--model", required=True, help="local MLX-LM model directory")
     encode.add_argument("--output", "-o", required=True)
     encode.add_argument("--max-tokens", type=int, default=2048)
+    encode.add_argument("--batch-size", type=int, default=2,
+                        help="training examples per MLX forward batch (student+teacher doubles the sequence batch)")
+    encode.add_argument("--pad-to", type=int, default=32,
+                        help="right-pad token lengths to this bucket size to reduce MLX shape recompilation")
+    encode.add_argument("--checkpoint-every", type=int, default=128,
+                        help="atomically checkpoint this many completed examples for automatic resume")
+    encode.add_argument("--no-resume", action="store_true",
+                        help="discard any partial checkpoints/output and start encoding from zero")
     encode.add_argument("--quiet", action="store_true")
 
     train = sub.add_parser("train", help="train LCFA latent predictor from cached frozen features")
@@ -63,14 +70,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "encode":
         examples = load_examples_jsonl(args.dataset)
         started = perf_counter()
-        plug = make_mlx_text_zplug(args.model, max_tokens=args.max_tokens)
+        plug = make_mlx_text_zplug(args.model, max_tokens=args.max_tokens, pad_to=args.pad_to)
 
         def report(index: int, total: int, example_id: str) -> None:
             if not args.quiet:
                 elapsed = perf_counter() - started
-                print(f"[lcfa-latent] encode {index}/{total} {example_id} elapsed={elapsed:.1f}s", file=sys.stderr, flush=True)
+                rate = index / elapsed if elapsed > 0 else 0.0
+                remaining = (total - index) / rate if rate > 0 else 0.0
+                print(
+                    f"[lcfa-latent] encode {index}/{total} {example_id} "
+                    f"elapsed={elapsed:.1f}s rate={rate:.2f}/s eta={remaining:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-        path = encode_examples(examples, plug, args.output, progress=report)
+        path = encode_examples(
+            examples,
+            plug,
+            args.output,
+            progress=report,
+            batch_size=args.batch_size,
+            checkpoint_every=args.checkpoint_every,
+            resume=not args.no_resume,
+        )
         print(str(path))
         return 0
 
