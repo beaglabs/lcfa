@@ -173,6 +173,18 @@ class HashTextZPlug:
         )
 
 
+def _mlx_array_to_float32_numpy(mx: Any, value: Any) -> np.ndarray:
+    """Convert an MLX array to NumPy without exposing bfloat16 via PEP 3118."""
+    value32 = value.astype(mx.float32)
+    mx.eval(value32)
+    try:
+        return np.array(value32, dtype=np.float32)
+    except (RuntimeError, TypeError, ValueError):
+        # Older MLX/Python combinations can still reject the buffer view. The
+        # list fallback intentionally avoids the buffer protocol entirely.
+        return np.asarray(value32.tolist(), dtype=np.float32)
+
+
 class MLXTextZPlug:
     """Frozen local MLX-LM hidden-state text enricher.
 
@@ -227,8 +239,7 @@ class MLXTextZPlug:
         tokens = self._mx.array([ids])
         hidden = self.model.model(tokens)
         vector = hidden[0, -1, :] if self.pool == "last" else self._mx.mean(hidden[0], axis=0)
-        self._mx.eval(vector)
-        arr = np.array(vector, dtype=np.float32)
+        arr = _mlx_array_to_float32_numpy(self._mx, vector)
         if self.normalize:
             norm = float(np.linalg.norm(arr))
             if norm > 0:
