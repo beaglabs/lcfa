@@ -135,6 +135,17 @@ def _load_feature_cache(path: str | Path) -> tuple[np.ndarray, np.ndarray, Mappi
     return student, teacher, metadata
 
 
+def _mlx_batch_indices(mx: Any, indices: Sequence[int] | np.ndarray) -> Any:
+    """Convert host-side shuffled indices into the MLX integer index type.
+
+    MLX supports advanced indexing with MLX arrays. Passing a NumPy integer
+    ndarray directly is not portable across MLX/Python versions, so normalize
+    through a plain Python list and construct an explicit int32 MLX array.
+    """
+    values = np.asarray(indices, dtype=np.int32).reshape(-1)
+    return mx.array(values.tolist(), dtype=mx.int32)
+
+
 def train_mlx_latent_predictor(
     feature_cache: str | Path,
     output_dir: str | Path,
@@ -213,12 +224,14 @@ def train_mlx_latent_predictor(
     count = int(student_np.shape[0])
     global_step = 0
     last_loss = 0.0
+    effective_batch_size = max(1, int(batch_size))
     for epoch in range(max(1, int(epochs))):
         permutation = np.random.permutation(count)
-        for start in range(0, count, max(1, int(batch_size))):
-            indices = permutation[start:start + max(1, int(batch_size))]
-            xb = student[indices]
-            yb = teacher[indices]
+        for start in range(0, count, effective_batch_size):
+            host_indices = permutation[start:start + effective_batch_size]
+            batch_indices = _mlx_batch_indices(mx, host_indices)
+            xb = student[batch_indices]
+            yb = teacher[batch_indices]
             loss, grads = loss_and_grad(model, xb, yb)
             optimizer.update(model, grads)
             target_params = model.target_encoder.parameters()
@@ -260,7 +273,7 @@ def train_mlx_latent_predictor(
     )
     digest = sha256(weights_path.read_bytes()).hexdigest()
     tensor_shapes = {
-        name: {"dtype": "F32", "shape": list(np.asarray(flat[name]).shape)}
+        name: {"dtype": "F32", "shape": list(flat[name].shape)}
         for name in required
     }
     manifest = {
