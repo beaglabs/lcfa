@@ -17,4 +17,7 @@ from .serde import IR_FORMAT, SerializationError, dump_ir, dumps_ir, from_ir_dic
 from .state import MemoryStateStore, StateConflictError, StateIdentity, StateNotFoundError, StateSnapshot, StateStore, StateStoreError, canonical_bytes, content_hash
 from .stochastic import FlowCandidate, FlowToolRequest, StochasticFlowReasoner
 
+# Keep mixed-benchmark helper bindings corrected for both CLI and direct imports.
+from . import bench_mixed_fixups as _bench_mixed_fixups
+
 __all__ = [name for name in globals() if not name.startswith("_")]
