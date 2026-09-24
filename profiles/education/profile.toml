@@ -1,6 +1,6 @@
 [profile]
 id = "education"
-version = "0.2.0"
+version = "0.3.0"
 description = "Reference institutional intelligence profile for education state reasoning."
 
 [entities]
@@ -43,6 +43,8 @@ enable = [
   "core.recommend",
   "stats.mean",
   "stats.delta",
+  "retrieval.rank",
+  "retrieval.recall_at_k",
   "temporal.window",
   "temporal.slope",
   "temporal.rolling_mean",
