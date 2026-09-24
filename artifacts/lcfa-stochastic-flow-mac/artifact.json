@@ -1,0 +1,67 @@
+{
+  "architecture": "lcfa.stochastic-flow.v1",
+  "base_backend": "lcfa-zero",
+  "config": {
+    "adaptation": {
+      "learning_rate": 0.08,
+      "reset_each_reason": true,
+      "score_weight": 0.5,
+      "type": "mlx-fast"
+    },
+    "backbone": {
+      "max_input_tokens": 4096,
+      "path": "../../models/Qwen3-4B-Instruct-2507-4bit",
+      "type": "mlx-local"
+    },
+    "flow": {
+      "beam_width": 2,
+      "branches": 2,
+      "fallback_to_anchor": true,
+      "max_new_tokens": 256,
+      "max_prompt_chars": 12000,
+      "max_steps": 3,
+      "max_tool_requests": 4,
+      "min_steps": 1,
+      "temperature": 0.7,
+      "top_p": 0.95
+    },
+    "tools": {
+      "allowed": [
+        "stats.*",
+        "temporal.*",
+        "cohort.*",
+        "hierarchy.*",
+        "anomaly.*",
+        "evidence.*",
+        "constraints.*",
+        "retrieval.*"
+      ]
+    },
+    "verifier": {
+      "enabled": true,
+      "max_new_tokens": 32,
+      "top_k": 1
+    }
+  },
+  "format": "lcfa.artifact.v1",
+  "id": "lcfa-stochastic-flow-mac",
+  "metadata": {
+    "purpose": "Apple-Silicon 8 GB development preset using a small 4-bit MLX backbone and session-scoped MLX fast prior.",
+    "quality": "development-preset"
+  },
+  "tensors": {
+    "score.confidence": {"dtype": "F32", "shape": [1]},
+    "score.evidence": {"dtype": "F32", "shape": [1]},
+    "score.final": {"dtype": "F32", "shape": [1]},
+    "score.logprob": {"dtype": "F32", "shape": [1]},
+    "score.parse": {"dtype": "F32", "shape": [1]},
+    "score.tool": {"dtype": "F32", "shape": [1]},
+    "score.verifier": {"dtype": "F32", "shape": [1]}
+  },
+  "version": "0.1.0",
+  "weights": {
+    "file": "model.safetensors",
+    "format": "safetensors",
+    "sha256": "fc581f8ea08cc651acbed285605b7b3be0510a7fe85cd2473d750a379bef7bbb"
+  }
+}
