@@ -17,6 +17,7 @@ from .protocol import ExecutionContext, Finding, ReasoningPlan, SolutionState
 ARTIFACT_FORMAT = "lcfa.artifact.v1"
 WEIGHTS_FORMAT = "safetensors"
 WEIGHTED_OUTPUT_ARCHITECTURE = "lcfa.weighted-output.v1"
+STOCHASTIC_FLOW_ARCHITECTURE = "lcfa.stochastic-flow.v1"
 
 
 class ArtifactError(ValueError):
@@ -38,6 +39,7 @@ class ArtifactManifest:
     weights: ArtifactWeights
     base_backend: str = "lcfa-zero"
     tensors: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    config: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     format: str = ARTIFACT_FORMAT
 
@@ -94,6 +96,7 @@ def load_artifact_manifest(path: str | Path) -> ArtifactManifest:
         weights=_weights_from_mapping(weights_raw),
         base_backend=str(raw.get("base_backend", "lcfa-zero")),
         tensors=dict(raw.get("tensors", {})),
+        config=dict(raw.get("config", {})),
         metadata=dict(raw.get("metadata", {})),
     )
 
@@ -156,14 +159,7 @@ def _affine_float(value: Any, scale: float, bias: float) -> Any:
 
 
 class SafetensorsReasonerAdapter:
-    """Reference weight-backed reasoner satisfying the standard LCFA contract.
-
-    ``lcfa.weighted-output.v1`` intentionally starts small: it runs the canonical
-    LCFA reasoning graph, then applies safetensors-backed affine calibration to
-    floating-point solution values/findings. This proves artifact loading,
-    integrity, tensor execution, and benchmark interchangeability without
-    pretending the reference artifact is already a learned continuous reasoner.
-    """
+    """Reference weight-backed reasoner satisfying the standard LCFA contract."""
 
     def __init__(
         self,
@@ -230,7 +226,9 @@ class SafetensorsReasonerAdapter:
         )
 
 
-ArtifactFactory = Callable[[Path, ArtifactManifest, LCFA | None], ArtifactReasoner]
+ArtifactFactory = Callable[
+    [Path, ArtifactManifest, LCFA | None, Mapping[str, Any]], ArtifactReasoner
+]
 _ARCHITECTURES: dict[str, ArtifactFactory] = {}
 
 
@@ -248,6 +246,7 @@ def _weighted_factory(
     root: Path,
     manifest: ArtifactManifest,
     base_engine: LCFA | None,
+    _runtime_options: Mapping[str, Any],
 ) -> ArtifactReasoner:
     return SafetensorsReasonerAdapter(
         manifest,
@@ -256,10 +255,28 @@ def _weighted_factory(
     )
 
 
+def _stochastic_factory(
+    root: Path,
+    manifest: ArtifactManifest,
+    base_engine: LCFA | None,
+    runtime_options: Mapping[str, Any],
+) -> ArtifactReasoner:
+    from .stochastic import StochasticFlowReasoner
+
+    return StochasticFlowReasoner.from_manifest(
+        root,
+        manifest,
+        weights_path=_resolve_weights_path(root, manifest),
+        base_engine=base_engine,
+        runtime_options=runtime_options,
+    )
+
+
 def load_artifact_reasoner(
     path: str | Path,
     *,
     base_engine: LCFA | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
 ) -> ArtifactReasoner:
     root, _manifest_path_value = _manifest_path(path)
     manifest = load_artifact_manifest(path)
@@ -270,14 +287,16 @@ def load_artifact_reasoner(
         raise ArtifactError(
             f"unsupported artifact architecture {manifest.architecture!r}; registered: {available}"
         ) from exc
-    return factory(root, manifest, base_engine)
+    return factory(root, manifest, base_engine, dict(runtime_options or {}))
 
 
 register_artifact_architecture(WEIGHTED_OUTPUT_ARCHITECTURE, _weighted_factory)
+register_artifact_architecture(STOCHASTIC_FLOW_ARCHITECTURE, _stochastic_factory)
 
 
 __all__ = [
     "ARTIFACT_FORMAT",
+    "STOCHASTIC_FLOW_ARCHITECTURE",
     "WEIGHTED_OUTPUT_ARCHITECTURE",
     "ArtifactError",
     "ArtifactManifest",

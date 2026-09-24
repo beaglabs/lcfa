@@ -24,6 +24,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+transformers = [
+  "transformers>=5.17,<6",
+  "torch>=2.6",
+  "accelerate>=1.14",
+]
 
 [project.scripts]
 lcfa-bench = "lcfa.bench_cli:main"
