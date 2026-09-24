@@ -261,9 +261,9 @@ def _stochastic_factory(
     base_engine: LCFA | None,
     runtime_options: Mapping[str, Any],
 ) -> ArtifactReasoner:
-    from .stochastic import StochasticFlowReasoner
+    from .adaptive_flow import AdaptiveStochasticFlowReasoner
 
-    return StochasticFlowReasoner.from_manifest(
+    return AdaptiveStochasticFlowReasoner.from_manifest(
         root,
         manifest,
         weights_path=_resolve_weights_path(root, manifest),
