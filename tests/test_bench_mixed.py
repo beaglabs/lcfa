@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import lcfa.bench_mixed_fixups  # applies audited mixed-harness helper fixups
 from lcfa.bench_mixed import (
     MixedBenchmarkRunner,
     _case,
@@ -22,7 +23,7 @@ def test_mixed_scalar_graders() -> None:
     assert _lcr_local_equivalent("The result is 65.8%.", ["65.8%"])
 
 
-def test_humaneval_executes_completion() -> None:
+def test_humaneval_executes_indented_completion() -> None:
     grade = _grade_humaneval(
         "    return 1",
         "def return1():\n",
@@ -31,6 +32,19 @@ def test_humaneval_executes_completion() -> None:
         timeout=5,
     )
     assert grade.passed
+
+
+def test_case_does_not_duplicate_prompt_into_plan_metadata() -> None:
+    prompt = "x" * 50_000
+    case = _case(
+        "lcr",
+        "long",
+        prompt,
+        {"kind": "lcr", "question": "q", "references": ["a"]},
+    )
+    assert case.context.metadata["query"] == prompt
+    assert "task" not in case.plan.metadata
+    assert prompt not in repr(case.plan.metadata)
 
 
 class _Subject:
