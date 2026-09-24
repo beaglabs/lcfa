@@ -14,6 +14,17 @@
       "type": "mlx-local"
     },
     "flow": {
+      "adaptive_compute": {
+        "confidence_threshold": 0.82,
+        "enabled": true,
+        "evidence_threshold": 0.5,
+        "expand_when_uncertain": true,
+        "initial_branches": 1,
+        "require_parsed": true,
+        "score_margin_threshold": 0.15,
+        "verifier_accept_threshold": 0.85,
+        "verify_when_uncertain": true
+      },
       "beam_width": 2,
       "branches": 2,
       "fallback_to_anchor": true,
@@ -46,7 +57,7 @@
   "format": "lcfa.artifact.v1",
   "id": "lcfa-stochastic-flow-mac",
   "metadata": {
-    "purpose": "Apple-Silicon 8 GB development preset using a small 4-bit MLX backbone and session-scoped MLX fast prior.",
+    "purpose": "Apple-Silicon 8 GB development preset using a small 4-bit MLX backbone, adaptive test-time compute, and session-scoped MLX fast prior.",
     "quality": "development-preset"
   },
   "tensors": {
@@ -58,7 +69,7 @@
     "score.tool": {"dtype": "F32", "shape": [1]},
     "score.verifier": {"dtype": "F32", "shape": [1]}
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "weights": {
     "file": "model.safetensors",
     "format": "safetensors",

@@ -4,12 +4,179 @@ from __future__ import annotations
 import argparse
 import importlib
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+import sys
+from typing import Any, Mapping
 
 from .artifact import load_artifact_reasoner
-from .bench import BenchmarkRunner, BenchmarkSuite, ReasonerSubject, compare_reports, dumps_benchmark_report, dumps_benchmark_suite, dumps_comparison, load_benchmark_report, load_benchmark_suite
+from .bench import BenchmarkReport, BenchmarkRunner, BenchmarkSuite, ReasonerSubject, compare_reports, dumps_benchmark_report, dumps_benchmark_suite, dumps_comparison, load_benchmark_report, load_benchmark_suite
 from .bench_corpus import all_suites
 from .engine import LCFA
+
+
+class _ProgressPrinter:
+    """Human-readable progress to stderr so JSON/stdout remains machine-safe."""
+
+    def __init__(self, *, suite: BenchmarkSuite, repeats: int, warmup: int) -> None:
+        self.suite = suite
+        self.repeats = repeats
+        self.warmup = warmup
+        self.calls_per_case = repeats + warmup
+        self.total_calls = len(suite.cases) * self.calls_per_case
+        self.reason_call = 0
+        self.backbone_call = 0
+
+    def _print(self, message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    def start(self, subject_hint: str) -> None:
+        self._print(
+            f"[lcfa] loading {subject_hint}; suite={self.suite.id} "
+            f"cases={len(self.suite.cases)} repeats={self.repeats} warmup={self.warmup}"
+        )
+
+    def loaded(self, subject: ReasonerSubject) -> None:
+        backend = subject.metadata.get("backend") if isinstance(subject.metadata, Mapping) else None
+        suffix = f" backend={backend}" if backend else ""
+        self._print(f"[lcfa] subject ready: {subject.name}{suffix}")
+
+    def wrap_subject(self, subject: ReasonerSubject) -> ReasonerSubject:
+        original = subject.reason
+
+        def reason(plan, context):
+            self.reason_call += 1
+            call = self.reason_call
+            if self.calls_per_case:
+                case_index = min((call - 1) // self.calls_per_case + 1, len(self.suite.cases))
+                slot = (call - 1) % self.calls_per_case + 1
+            else:
+                case_index = 1
+                slot = 1
+            case_id = (
+                self.suite.cases[case_index - 1].id
+                if self.suite.cases and 0 < case_index <= len(self.suite.cases)
+                else plan.id
+            )
+            if slot <= self.warmup:
+                phase = f"warmup {slot}/{self.warmup}"
+            else:
+                repeat = slot - self.warmup
+                phase = f"repeat {repeat}/{self.repeats}"
+            self._print(
+                f"[lcfa] case {case_index}/{len(self.suite.cases)} {case_id} "
+                f"({phase}) start [{call}/{self.total_calls}]"
+            )
+            started = perf_counter()
+            try:
+                result = original(plan, context)
+            except Exception as exc:
+                elapsed = perf_counter() - started
+                self._print(
+                    f"[lcfa] case {case_index}/{len(self.suite.cases)} {case_id} "
+                    f"error after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
+                )
+                raise
+            elapsed = perf_counter() - started
+            flow = result.metadata.get("stochastic_flow", {}) if result.metadata else {}
+            adaptive = flow.get("adaptive_compute", {}) if isinstance(flow, Mapping) else {}
+            detail = ""
+            if isinstance(adaptive, Mapping) and adaptive.get("enabled"):
+                detail = (
+                    f" steps={adaptive.get('steps_used')}"
+                    f" candidates={adaptive.get('generated_candidates')}"
+                    f" verifiers={adaptive.get('verifier_calls')}"
+                )
+            self._print(
+                f"[lcfa] case {case_index}/{len(self.suite.cases)} {case_id} "
+                f"done in {elapsed:.1f}s{detail}"
+            )
+            return result
+
+        return ReasonerSubject(subject.name, reason, metadata=subject.metadata)
+
+    def note(self, payload: Mapping[str, Any]) -> None:
+        event = str(payload.get("event", ""))
+        if event == "adaptive_reason_start":
+            self._print(
+                f"[lcfa]   adaptive budget: start={payload.get('initial_branches')} branch, "
+                f"max={payload.get('max_branches')} branches x {payload.get('max_steps')} steps"
+            )
+        elif event == "adaptive_step_start":
+            self._print(
+                f"[lcfa]   step {payload.get('step')}/{payload.get('max_steps')} "
+                f"parents={payload.get('parents')} initial_branches={payload.get('initial_branches')}"
+            )
+        elif event == "adaptive_expand":
+            reasons = ",".join(payload.get("reasons", [])) or "uncertain"
+            self._print(
+                f"[lcfa]   adaptive expand: +{payload.get('added_candidates')} candidate(s) "
+                f"because {reasons}"
+            )
+        elif event == "adaptive_verify":
+            reasons = ",".join(payload.get("reasons", [])) or "resolved"
+            self._print(
+                f"[lcfa]   verifier: {payload.get('verifier_calls')} call(s); remaining={reasons}"
+            )
+        elif event == "adaptive_step_complete":
+            reasons = ",".join(payload.get("reasons", [])) or "none"
+            action = "stop" if payload.get("stop") else "continue"
+            self._print(
+                f"[lcfa]   step {payload.get('step')} -> {action}; "
+                f"confidence={float(payload.get('confidence', 0.0)):.2f} "
+                f"evidence={float(payload.get('evidence_score', 0.0)):.2f} "
+                f"uncertainty={reasons}"
+            )
+        elif event == "adaptive_reason_complete":
+            self._print(
+                f"[lcfa]   adaptive complete: steps={payload.get('steps_used')} "
+                f"candidates={payload.get('generated_candidates')} "
+                f"verifiers={payload.get('verifier_calls')} expansions={payload.get('expansions')}"
+            )
+
+    def complete(self, report: BenchmarkReport) -> None:
+        summary = report.summary
+        self._print(
+            f"[lcfa] complete: {summary.passed_cases}/{summary.case_count} cases passed; "
+            f"assertions={summary.assertion_accuracy:.3f} error_rate={summary.error_rate:.3f}"
+        )
+
+
+class _ProgressBackbone:
+    """Transparent backbone proxy that reports each expensive model invocation."""
+
+    def __init__(self, inner: Any, progress: _ProgressPrinter) -> None:
+        self.inner = inner
+        self.progress = progress
+        self.metadata = getattr(inner, "metadata", {})
+
+    def note(self, payload: Mapping[str, Any]) -> None:
+        self.progress.note(payload)
+
+    def sample(self, **kwargs: Any):
+        self.progress.backbone_call += 1
+        call = self.progress.backbone_call
+        system_prompt = str(kwargs.get("system_prompt", ""))
+        kind = "verify" if "LCFA_VERIFIER" in system_prompt else "proposal"
+        branches = int(kwargs.get("branches", 1))
+        max_new_tokens = int(kwargs.get("max_new_tokens", 0))
+        self.progress._print(
+            f"[lcfa]     model call {call} {kind}: branches={branches} max_new_tokens={max_new_tokens}"
+        )
+        started = perf_counter()
+        try:
+            result = self.inner.sample(**kwargs)
+        except Exception as exc:
+            elapsed = perf_counter() - started
+            self.progress._print(
+                f"[lcfa]     model call {call} {kind} failed after {elapsed:.1f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        elapsed = perf_counter() - started
+        self.progress._print(
+            f"[lcfa]     model call {call} {kind} done in {elapsed:.1f}s; samples={len(result)}"
+        )
+        return result
 
 
 def _load_factory(spec: str) -> Any:
@@ -19,7 +186,7 @@ def _load_factory(spec: str) -> Any:
     return getattr(importlib.import_module(module_name), attr)()
 
 
-def _subject_from_args(args: argparse.Namespace) -> ReasonerSubject:
+def _subject_from_args(args: argparse.Namespace, progress: _ProgressPrinter | None = None) -> ReasonerSubject:
     base_engine = LCFA.from_profile(args.profile) if args.profile else LCFA()
     if args.artifact:
         runtime_options = {k: v for k, v in {
@@ -36,6 +203,8 @@ def _subject_from_args(args: argparse.Namespace) -> ReasonerSubject:
             "prior_snapshot": getattr(args, "prior_snapshot", None),
         }.items() if v is not None}
         reasoner = load_artifact_reasoner(args.artifact, base_engine=base_engine, runtime_options=runtime_options)
+        if progress is not None and hasattr(reasoner, "backbone"):
+            reasoner.backbone = _ProgressBackbone(reasoner.backbone, progress)
         return ReasonerSubject(name=args.name or reasoner.artifact.id, reasoner=reasoner.reason, metadata=dict(reasoner.metadata))
     if args.factory:
         engine = _load_factory(args.factory)
@@ -90,6 +259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--prior-snapshot", help="write final fast prior to a safetensors file")
     run.add_argument("--repeats", type=int, default=3)
     run.add_argument("--warmup", type=int, default=0)
+    run.add_argument("--quiet", action="store_true", help="disable human-readable progress reporting on stderr")
     run.add_argument("--output", "-o")
     compare = subparsers.add_parser("compare")
     compare.add_argument("reports", nargs="+")
@@ -106,7 +276,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "run":
-        text = dumps_benchmark_report(BenchmarkRunner(repeats=args.repeats, warmup=args.warmup).run(_subject_from_args(args), _load_suite(args.suite)))
+        suite = _load_suite(args.suite)
+        progress = None if args.quiet else _ProgressPrinter(suite=suite, repeats=args.repeats, warmup=args.warmup)
+        if progress is not None:
+            progress.start(args.artifact or args.factory or args.name or "lcfa-zero")
+        subject = _subject_from_args(args, progress)
+        if progress is not None:
+            progress.loaded(subject)
+            subject = progress.wrap_subject(subject)
+        report = BenchmarkRunner(repeats=args.repeats, warmup=args.warmup).run(subject, suite)
+        if progress is not None:
+            progress.complete(report)
+        text = dumps_benchmark_report(report)
     elif args.command == "compare":
         text = dumps_comparison(compare_reports(tuple(load_benchmark_report(p) for p in args.reports), baseline_subject=args.baseline))
     elif args.command == "export":
