@@ -1,6 +1,7 @@
 """Batched, resumable frozen-feature extraction for latent-flow training."""
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
@@ -22,6 +23,35 @@ def _ids_path(output: Path) -> Path:
     return output.with_suffix(output.suffix + ".ids.json")
 
 
+def _zplug_fingerprint(zplug: ZPlug) -> str:
+    manifest = zplug.manifest
+    payload = {
+        "id": manifest.id,
+        "version": manifest.version,
+        "modalities": list(manifest.modalities),
+        "capabilities": list(manifest.capabilities),
+        "priority": manifest.priority,
+        "requires_network": manifest.requires_network,
+        "metadata": dict(manifest.metadata),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _dataset_fingerprint(examples: Sequence[TextLatentExample]) -> str:
+    digest = sha256()
+    for example in examples:
+        payload = {
+            "id": example.id,
+            "student_text": example.student_text,
+            "teacher_text": example.teacher_text,
+            "metadata": dict(example.metadata),
+        }
+        digest.update(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _encode_batch(zplug: ZPlug, observations: Sequence[Observation],
                   contexts: Sequence[ZContext]) -> tuple:
     batch_fn = getattr(zplug, "encode_batch", None)
@@ -34,6 +64,8 @@ def _completed_count(parts: Path, examples: Sequence[TextLatentExample], zplug: 
     processed = 0
     if not parts.exists():
         return 0
+    encoder_fingerprint = _zplug_fingerprint(zplug)
+    dataset_fingerprint = _dataset_fingerprint(examples)
     for path in sorted(parts.glob("part-*.safetensors")):
         with safe_open(str(path), framework="np", device="cpu") as handle:
             metadata = handle.metadata() or {}
@@ -41,6 +73,16 @@ def _completed_count(parts: Path, examples: Sequence[TextLatentExample], zplug: 
                 raise ValueError(f"invalid latent feature checkpoint format: {path}")
             if metadata.get("zplug_id") != zplug.manifest.id:
                 raise ValueError(f"latent checkpoint zplug mismatch: {path}")
+            if metadata.get("zplug_fingerprint") != encoder_fingerprint:
+                raise ValueError(
+                    f"latent checkpoint encoder configuration mismatch: {path}; "
+                    "remove the .parts directory or rerun with --no-resume"
+                )
+            if metadata.get("dataset_fingerprint") != dataset_fingerprint:
+                raise ValueError(
+                    f"latent checkpoint dataset content mismatch: {path}; "
+                    "remove the .parts directory or rerun with --no-resume"
+                )
             start = int(metadata.get("start", "-1"))
             count = int(metadata.get("count", "0"))
             ids = json.loads(metadata.get("ids_json", "[]"))
@@ -56,7 +98,8 @@ def _completed_count(parts: Path, examples: Sequence[TextLatentExample], zplug: 
 
 
 def _write_part(parts: Path, *, start: int, ids: Sequence[str], student: Sequence[np.ndarray],
-                teacher: Sequence[np.ndarray], zplug: ZPlug) -> None:
+                teacher: Sequence[np.ndarray], zplug: ZPlug,
+                dataset_fingerprint: str) -> None:
     if not ids:
         return
     student_array = np.stack(student).astype(np.float32, copy=False)
@@ -73,6 +116,8 @@ def _write_part(parts: Path, *, start: int, ids: Sequence[str], student: Sequenc
             "format": LATENT_FEATURES_FORMAT,
             "zplug_id": zplug.manifest.id,
             "zplug_version": zplug.manifest.version,
+            "zplug_fingerprint": _zplug_fingerprint(zplug),
+            "dataset_fingerprint": dataset_fingerprint,
             "start": str(start),
             "count": str(len(ids)),
             "feature_dim": str(student_array.shape[1]),
@@ -83,7 +128,8 @@ def _write_part(parts: Path, *, start: int, ids: Sequence[str], student: Sequenc
 
 
 def _finalize_parts(parts: Path, output: Path, examples: Sequence[TextLatentExample], zplug: ZPlug,
-                    *, batch_size: int, checkpoint_every: int) -> None:
+                    *, batch_size: int, checkpoint_every: int,
+                    dataset_fingerprint: str) -> None:
     student_chunks: list[np.ndarray] = []
     teacher_chunks: list[np.ndarray] = []
     total = 0
@@ -114,6 +160,8 @@ def _finalize_parts(parts: Path, output: Path, examples: Sequence[TextLatentExam
             "format": LATENT_FEATURES_FORMAT,
             "zplug_id": zplug.manifest.id,
             "zplug_version": zplug.manifest.version,
+            "zplug_fingerprint": _zplug_fingerprint(zplug),
+            "dataset_fingerprint": dataset_fingerprint,
             "count": str(len(examples)),
             "feature_dim": str(feature_dim),
             "encode_batch_size": str(batch_size),
@@ -138,6 +186,8 @@ def _completed_output(output: Path, examples: Sequence[TextLatentExample], zplug
         return (
             metadata.get("format") == LATENT_FEATURES_FORMAT
             and metadata.get("zplug_id") == zplug.manifest.id
+            and metadata.get("zplug_fingerprint") == _zplug_fingerprint(zplug)
+            and metadata.get("dataset_fingerprint") == _dataset_fingerprint(examples)
             and int(metadata.get("count", "-1")) == len(examples)
             and len(shape) == 2
             and shape[0] == len(examples)
@@ -158,6 +208,7 @@ def encode_examples(examples: Sequence[TextLatentExample], zplug: ZPlug,
     parts = _parts_dir(output_path)
     effective_batch = max(1, int(batch_size))
     checkpoint_every = max(effective_batch, int(checkpoint_every))
+    dataset_fingerprint = _dataset_fingerprint(examples)
 
     if resume and _completed_output(output_path, examples, zplug):
         return output_path
@@ -206,6 +257,7 @@ def encode_examples(examples: Sequence[TextLatentExample], zplug: ZPlug,
                 student=shard_student,
                 teacher=shard_teacher,
                 zplug=zplug,
+                dataset_fingerprint=dataset_fingerprint,
             )
             shard_start += len(shard_ids)
             shard_ids.clear()
@@ -219,6 +271,7 @@ def encode_examples(examples: Sequence[TextLatentExample], zplug: ZPlug,
         zplug,
         batch_size=effective_batch,
         checkpoint_every=checkpoint_every,
+        dataset_fingerprint=dataset_fingerprint,
     )
     shutil.rmtree(parts, ignore_errors=True)
     return output_path
