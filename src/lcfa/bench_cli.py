@@ -7,6 +7,7 @@ import importlib
 from pathlib import Path
 from typing import Any
 
+from .artifact import load_artifact_reasoner
 from .bench import (
     BenchmarkRunner,
     BenchmarkSuite,
@@ -32,6 +33,16 @@ def _load_factory(spec: str) -> Any:
 
 
 def _subject_from_args(args: argparse.Namespace) -> ReasonerSubject:
+    base_engine = LCFA.from_profile(args.profile) if args.profile else LCFA()
+
+    if args.artifact:
+        reasoner = load_artifact_reasoner(args.artifact, base_engine=base_engine)
+        return ReasonerSubject(
+            name=args.name or reasoner.artifact.id,
+            reasoner=reasoner.reason,
+            metadata=dict(reasoner.metadata),
+        )
+
     if args.factory:
         engine = _load_factory(args.factory)
         if isinstance(engine, ReasonerSubject):
@@ -48,23 +59,19 @@ def _subject_from_args(args: argparse.Namespace) -> ReasonerSubject:
             metadata={"factory": args.factory},
         )
 
-    engine = LCFA.from_profile(args.profile) if args.profile else LCFA()
     return ReasonerSubject.from_engine(
         args.name or "lcfa-zero",
-        engine,
+        base_engine,
         metadata={
             "backend": "deterministic",
-            "profile": engine.profile.id if engine.profile is not None else None,
+            "profile": base_engine.profile.id if base_engine.profile is not None else None,
         },
     )
 
 
 def _builtins() -> dict[str, BenchmarkSuite]:
     suites = all_suites()
-    result = {
-        suite.id.removeprefix("lcfa-core-"): suite
-        for suite in suites
-    }
+    result = {suite.id.removeprefix("lcfa-core-"): suite for suite in suites}
     result.update({suite.id: suite for suite in suites})
     result["all"] = BenchmarkSuite(
         id="lcfa-core-all",
@@ -101,10 +108,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to an lcfa.bench.v1 suite or builtin:<family>/builtin:all",
     )
     run.add_argument("--name", help="subject name in the report")
-    run.add_argument("--profile", help="LCFA profile path for the built-in runtime")
-    run.add_argument(
+    run.add_argument("--profile", help="LCFA profile path for the built-in/base runtime")
+    backend = run.add_mutually_exclusive_group()
+    backend.add_argument(
         "--factory",
         help="module:callable returning an engine with reason(plan, context)",
+    )
+    backend.add_argument(
+        "--artifact",
+        help="path to an lcfa.artifact.v1 directory or artifact.json",
     )
     run.add_argument("--repeats", type=int, default=3)
     run.add_argument("--warmup", type=int, default=0)
@@ -137,9 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         text = dumps_benchmark_report(report)
     elif args.command == "compare":
         reports = tuple(load_benchmark_report(path) for path in args.reports)
-        text = dumps_comparison(
-            compare_reports(reports, baseline_subject=args.baseline)
-        )
+        text = dumps_comparison(compare_reports(reports, baseline_subject=args.baseline))
     elif args.command == "export":
         suite = _load_suite(args.suite)
         Path(args.output).write_text(dumps_benchmark_suite(suite) + "\n", encoding="utf-8")

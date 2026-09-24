@@ -1,6 +1,19 @@
 """LCFA public API."""
 
 from .actions import RecommendationActionCompiler
+from .artifact import (
+    ARTIFACT_FORMAT,
+    WEIGHTED_OUTPUT_ARCHITECTURE,
+    ArtifactError,
+    ArtifactManifest,
+    ArtifactReasoner,
+    ArtifactWeights,
+    SafetensorsReasonerAdapter,
+    artifact_architectures,
+    load_artifact_manifest,
+    load_artifact_reasoner,
+    register_artifact_architecture,
+)
 from .bench import (
     BENCH_FORMAT,
     COMPARISON_FORMAT,
@@ -78,6 +91,7 @@ from .state import (
 )
 
 __all__ = [
+    "ARTIFACT_FORMAT",
     "ActionExecutor",
     "ActionGraph",
     "ActionNode",
@@ -86,6 +100,10 @@ __all__ = [
     "ActionResult",
     "ActionRun",
     "ActionSpec",
+    "ArtifactError",
+    "ArtifactManifest",
+    "ArtifactReasoner",
+    "ArtifactWeights",
     "AssertionResult",
     "BENCH_FORMAT",
     "BenchmarkCase",
@@ -121,6 +139,7 @@ __all__ = [
     "ReasoningPlan",
     "Recommendation",
     "RecommendationActionCompiler",
+    "SafetensorsReasonerAdapter",
     "SerializationError",
     "SolutionState",
     "StateConflictError",
@@ -129,7 +148,9 @@ __all__ = [
     "StateSnapshot",
     "StateStore",
     "StateStoreError",
+    "WEIGHTED_OUTPUT_ARCHITECTURE",
     "all_suites",
+    "artifact_architectures",
     "benchmark_report_from_dict",
     "benchmark_report_to_dict",
     "benchmark_suite_from_dict",
@@ -145,6 +166,8 @@ __all__ = [
     "dumps_comparison",
     "dumps_ir",
     "from_ir_dict",
+    "load_artifact_manifest",
+    "load_artifact_reasoner",
     "load_benchmark_report",
     "load_benchmark_suite",
     "load_ir",
@@ -152,6 +175,7 @@ __all__ = [
     "loads_benchmark_report",
     "loads_benchmark_suite",
     "loads_ir",
+    "register_artifact_architecture",
     "register_core_operators",
     "register_reasoning_operators",
     "suite_by_id",

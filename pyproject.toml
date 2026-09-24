@@ -18,6 +18,8 @@ classifiers = [
 ]
 dependencies = [
   "blake3>=1.0",
+  "numpy>=1.26",
+  "safetensors>=0.5",
 ]
 
 [project.optional-dependencies]
