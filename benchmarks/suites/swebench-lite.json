@@ -1,0 +1,14 @@
+{
+  "id": "swebench-lite",
+  "version": "1",
+  "source": {
+    "dataset": "SWE-bench/SWE-bench_Lite",
+    "split": "test",
+    "expected_rows": 300
+  },
+  "selection": {
+    "method": "all-rows",
+    "count": 300
+  },
+  "purpose": "milestone software-engineering evaluation; official Docker grader required"
+}

@@ -1,0 +1,83 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Frozen evaluation suite
+        required: true
+        type: choice
+        options:
+          - gsm8k-system-240
+          - swebench-lite
+      artifact:
+        description: LCFA artifact directory
+        required: true
+        default: artifacts/lcfa-stochastic-flow-reference
+        type: string
+      repeats:
+        description: Repeats per case
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[benchmarks]'
+
+      - name: Materialize frozen suite
+        run: |
+          lcfa-bench-suite build "${{ inputs.suite }}" -o benchmark-suite.json
+
+      - name: Run benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ "${{ inputs.suite }}" == "swebench-lite" ]]; then
+            extra+=(--swebench-eval --swebench-timeout 1800)
+          fi
+          lcfa-bench-mixed run benchmark-suite.json \
+            --artifact "${{ inputs.artifact }}" \
+            --repeats "${{ inputs.repeats }}" \
+            "${extra[@]}" \
+            -o benchmark-report.json
+
+      - name: Render benchmark card
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f benchmark-report.json ]]; then
+            lcfa-bench-card benchmark-report.json \
+              --title "${{ inputs.suite }} · ${{ inputs.artifact }}" \
+              | tee benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## LCFA Benchmark"
+              echo
+              echo "Benchmark did not produce a report. Inspect the job log for the failure."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcfa-${{ inputs.suite }}-${{ github.run_id }}
+          path: |
+            benchmark-suite.json
+            benchmark-report.json
+            benchmark-summary.md
+          if-no-files-found: warn

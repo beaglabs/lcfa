@@ -25,7 +25,10 @@ jobs:
         run: |
           lcfa-bench --help >/dev/null
           lcfa-bench-mixed --help >/dev/null
+          lcfa-bench-suite --help >/dev/null
+          lcfa-bench-card --help >/dev/null
           lcfa-latent --help >/dev/null
+          lcfa-bench-suite list >/dev/null
           printf 'LCFA latent training example\n' > /tmp/lcfa-corpus.txt
           lcfa-latent prepare /tmp/lcfa-corpus.txt --mask-ratio 0.25 --seed 7 -o /tmp/lcfa-latent.jsonl
           test -s /tmp/lcfa-latent.jsonl

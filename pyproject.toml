@@ -48,6 +48,8 @@ benchmarks = [
 [project.scripts]
 lcfa-bench = "lcfa.bench_cli:main"
 lcfa-bench-mixed = "lcfa.bench_mixed_cli:main"
+lcfa-bench-suite = "lcfa.bench_suite_cli:main"
+lcfa-bench-card = "lcfa.bench_card:main"
 lcfa-latent = "lcfa.latent_cli:main"
 
 [tool.pytest.ini_options]
