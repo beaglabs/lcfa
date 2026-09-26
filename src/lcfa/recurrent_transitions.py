@@ -3,6 +3,10 @@
 The semantic agent records ``lcfa.semantic-trajectory.v1`` episodes. This
 module turns those episodes into one-step supervision records suitable for a
 recurrent controller: event_t -> action_t / stop_t / value_t.
+
+The controller event stream intentionally excludes teacher/oracle hypotheses
+and semantic cognition snapshots. Action supervision may only depend on the
+goal plus prior actions/observations that are also available during rollout.
 """
 from __future__ import annotations
 
@@ -12,7 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v1"
+RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v2"
+LEGACY_RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v1"
 
 ACTION_VOCAB: tuple[str, ...] = (
     "repo.read",
@@ -47,6 +52,29 @@ class RecurrentTransition:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the rollout-available recurrent event schema.
+
+    Legacy v1 datasets may contain ``hypothesis`` or ``cognition`` fields.
+    They are stripped at load time so old files cannot accidentally reintroduce
+    teacher information into training.
+    """
+    kind = str(event.get("kind") or "")
+    if kind == "goal":
+        return {"kind": "goal", "goal": str(event.get("goal") or "")}
+    if kind == "transition":
+        action = event.get("action")
+        observation = event.get("observation")
+        return {
+            "kind": "transition",
+            "action": dict(action) if isinstance(action, Mapping) else None,
+            "observation": (
+                dict(observation) if isinstance(observation, Mapping) else {}
+            ),
+        }
+    return dict(event)
 
 
 def _episode_success(episode: Mapping[str, Any]) -> float | None:
@@ -95,17 +123,12 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         terminal = bool(step.get("terminal", False))
 
         if position == 1:
-            event: Mapping[str, Any] = {
-                "kind": "goal",
-                "goal": goal,
-                "hypothesis": step.get("hypothesis"),
-            }
+            event: Mapping[str, Any] = {"kind": "goal", "goal": goal}
         else:
             event = {
                 "kind": "transition",
                 "action": dict(previous_action) if previous_action else None,
                 "observation": dict(previous_observation),
-                "hypothesis": step.get("hypothesis"),
             }
 
         out.append(
@@ -142,20 +165,29 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
             raw = json.loads(text)
             if not isinstance(raw, Mapping):
                 raise ValueError(f"transition line {line_number} is not an object")
-            if str(raw.get("schema_version", "")) != RECURRENT_TRANSITION_FORMAT:
-                raise ValueError(f"transition line {line_number} has wrong schema_version")
+            schema = str(raw.get("schema_version", ""))
+            if schema not in {
+                RECURRENT_TRANSITION_FORMAT,
+                LEGACY_RECURRENT_TRANSITION_FORMAT,
+            }:
+                raise ValueError(
+                    f"transition line {line_number} has wrong schema_version"
+                )
             rows.append(
                 RecurrentTransition(
                     episode_id=str(raw["episode_id"]),
                     step_index=int(raw["step_index"]),
                     goal=str(raw["goal"]),
-                    event=dict(_mapping(raw.get("event"))),
+                    event=normalize_event(dict(_mapping(raw.get("event")))),
                     target_action=str(raw["target_action"]),
                     stop_target=bool(raw["stop_target"]),
                     value_target=(
                         None if raw.get("value_target") is None else float(raw["value_target"])
                     ),
-                    metadata=dict(_mapping(raw.get("metadata"))),
+                    metadata={
+                        **dict(_mapping(raw.get("metadata"))),
+                        "source_transition_format": schema,
+                    },
                 )
             )
     return tuple(rows)
@@ -167,7 +199,10 @@ def dump_transitions(rows: Iterable[RecurrentTransition], path: str | Path) -> i
     count = 0
     with target.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row.to_dict(), sort_keys=True, ensure_ascii=False) + "\n")
+            payload = dict(row.to_dict())
+            payload["event"] = normalize_event(row.event)
+            payload["schema_version"] = RECURRENT_TRANSITION_FORMAT
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n")
             count += 1
     return count
 
@@ -189,11 +224,13 @@ def prepare_transition_file(episodes: Sequence[str | Path], output: str | Path) 
 
 __all__ = [
     "ACTION_VOCAB",
+    "LEGACY_RECURRENT_TRANSITION_FORMAT",
     "RECURRENT_TRANSITION_FORMAT",
     "RecurrentTransition",
     "dump_transitions",
     "episode_to_transitions",
     "load_episode",
     "load_transitions",
+    "normalize_event",
     "prepare_transition_file",
 ]
