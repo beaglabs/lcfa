@@ -48,7 +48,7 @@ def _episode(*, success=None, episode_id="semantic-episode:test"):
     return value
 
 
-def test_episode_to_recurrent_transitions_uses_explicit_targets_only() -> None:
+def test_episode_to_recurrent_transitions_uses_rollout_available_state_only() -> None:
     rows = episode_to_transitions(_episode())
     assert len(rows) == 2
     assert rows[0].target_action == "repo.read"
@@ -56,6 +56,19 @@ def test_episode_to_recurrent_transitions_uses_explicit_targets_only() -> None:
     assert rows[1].target_action == "stop"
     assert rows[1].stop_target is True
     assert rows[0].value_target is None
+    assert rows[0].event == {
+        "kind": "goal",
+        "goal": "Fix Optional name normalization",
+    }
+    assert rows[1].event == {
+        "kind": "transition",
+        "action": {"name": "repo.read", "inputs": {"path": "pkg/models.py"}},
+        "observation": {"concept_id": "observation://1", "content_hash": "b3:one"},
+    }
+    assert "hypothesis" not in rows[0].event
+    assert "hypothesis" not in rows[1].event
+    assert "cognition" not in rows[0].event
+    assert "verify.run" in ACTION_VOCAB
 
     graded = episode_to_transitions(_episode(success=True))
     assert all(row.value_target == 1.0 for row in graded)
@@ -72,6 +85,33 @@ def test_prepare_transition_file_round_trips_jsonl(tmp_path: Path) -> None:
     assert len(rows) == 2
     assert rows[0].value_target == 0.0
     assert rows[-1].target_action == "stop"
+    raw = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert raw["schema_version"] == "lcfa.recurrent-transition.v2"
+
+
+def test_legacy_transition_loader_strips_teacher_only_state(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(
+        json.dumps({
+            "schema_version": "lcfa.recurrent-transition.v1",
+            "episode_id": "legacy",
+            "step_index": 1,
+            "goal": "fix it",
+            "event": {
+                "kind": "goal",
+                "goal": "fix it",
+                "hypothesis": {"claim": "teacher hint"},
+                "cognition": {"private": "state"},
+            },
+            "target_action": "repo.search",
+            "stop_target": False,
+            "value_target": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    row = load_transitions(path)[0]
+    assert row.event == {"kind": "goal", "goal": "fix it"}
+    assert row.metadata["source_transition_format"] == "lcfa.recurrent-transition.v1"
 
 
 def test_validation_split_keeps_whole_episodes_together() -> None:
@@ -176,7 +216,11 @@ def test_rwkv_semantic_backbone_preserves_recurrent_state_and_resolves_repo_read
     _repo(tmp_path)
     with SQLiteSemanticGraph(tmp_path / ".lcfa" / "semantic.db") as graph:
         PythonRepoIndexer(graph, tmp_path).index()
-        candidate = next(node for node in graph.search("normalize_name", limit=10) if node.kind == "method")
+        candidate = next(
+            node
+            for node in graph.search("normalize_name", limit=10)
+            if node.kind == "method"
+        )
         policy = _FakeRecurrentPolicy()
         backbone = RWKVSemanticBackbone(policy, graph)
         payload = {
@@ -196,11 +240,16 @@ def test_rwkv_semantic_backbone_preserves_recurrent_state_and_resolves_repo_read
             max_new_tokens=32,
         )
         choice = json.loads(first[0].text)
-        assert choice["action"] == {"name": "repo.read", "inputs": {"path": "pkg/models.py"}}
+        assert choice["action"] == {
+            "name": "repo.read",
+            "inputs": {"path": "pkg/models.py"},
+        }
         assert policy.reset_calls == 1
         assert policy.observe_calls == 0
 
-        payload["recent_observations"] = [{"content_hash": "b3:obs", "result": "read"}]
+        payload["recent_observations"] = [
+            {"content_hash": "b3:obs", "result": "read"}
+        ]
         second = backbone.sample(
             system_prompt="ignored",
             user_prompt=json.dumps(payload),

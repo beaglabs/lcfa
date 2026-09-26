@@ -1,4 +1,4 @@
-"""CLI for LCFA semantic repository indexing, investigation, and agent execution."""
+"""CLI for LCFA semantic repository indexing, investigation, and RWKV agent execution."""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +33,10 @@ def _default_db(root: str | Path) -> Path:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="lcfa-semantic", description="Content-addressed semantic runtime for repositories and terminal agents.")
+    parser = argparse.ArgumentParser(
+        prog="lcfa-semantic",
+        description="Content-addressed semantic runtime for repositories and RWKV terminal agents.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     index = sub.add_parser("index", help="index a Python repository into a persistent semantic graph")
@@ -47,7 +50,10 @@ def _parser() -> argparse.ArgumentParser:
     concept.add_argument("--limit", type=int, default=20)
     concept.add_argument("--neighbors", action="store_true")
 
-    investigate = sub.add_parser("investigate", help="form an evidence-linked cognitive SolutionState for a goal/issue")
+    investigate = sub.add_parser(
+        "investigate",
+        help="form an evidence-linked cognitive SolutionState for a goal/issue",
+    )
     investigate.add_argument("goal")
     investigate.add_argument("--root", default=".")
     investigate.add_argument("--db")
@@ -60,19 +66,33 @@ def _parser() -> argparse.ArgumentParser:
     actions.add_argument("--db")
     actions.add_argument("--limit", type=int, default=12)
 
-    agent = sub.add_parser("agent", help="run the closed-loop semantic coding/terminal agent")
+    agent = sub.add_parser("agent", help="run the closed-loop RWKV semantic coding/terminal agent")
     agent.add_argument("goal")
     agent.add_argument("--root", default=".")
     agent.add_argument("--db")
-    controller = agent.add_mutually_exclusive_group(required=True)
-    controller.add_argument("--artifact", help="stochastic language-policy artifact")
-    controller.add_argument("--rwkv-controller", help="directory containing trained controller.json + heads.safetensors")
+    agent.add_argument(
+        "--rwkv-controller",
+        required=True,
+        help="directory containing controller.json + heads.safetensors",
+    )
     agent.add_argument("--rwkv-model", help="override controller manifest RWKV model id")
-    agent.add_argument("--rwkv-device", help="RWKV device override, e.g. mps/cuda/cpu")
-    agent.add_argument("--rwkv-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    agent.add_argument("--rwkv-device", default="auto", help="auto, mps, cuda, cuda:N, or cpu")
+    agent.add_argument(
+        "--rwkv-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
     agent.add_argument("--max-steps", type=int, default=12)
-    agent.add_argument("--allow-docs", action="store_true", help="enable allowlisted live documentation retrieval")
-    agent.add_argument("--auto-approve", action="store_true", help="approve workspace edits/process actions; use only inside an isolated benchmark/worktree")
+    agent.add_argument(
+        "--allow-docs",
+        action="store_true",
+        help="enable allowlisted live documentation retrieval",
+    )
+    agent.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="approve workspace edits/process actions; use only inside an isolated benchmark/worktree",
+    )
     agent.add_argument("--output", "-o")
     return parser
 
@@ -100,37 +120,30 @@ def main(argv: list[str] | None = None) -> int:
                 nodes = graph.search(args.query, limit=args.limit)
                 payload = {"matches": nodes}
                 if args.neighbors:
-                    payload["neighbors"] = {node.id: graph.neighbors(node.id, limit=20) for node in nodes[:5]}
+                    payload["neighbors"] = {
+                        node.id: graph.neighbors(node.id, limit=20) for node in nodes[:5]
+                    }
                 _print(payload)
                 return 0
 
         if args.command == "agent":
             PythonRepoIndexer(graph, root).index()
-            if args.rwkv_controller:
-                from .rwkv_semantic import load_rwkv_semantic_backbone
+            from .rwkv_semantic import load_rwkv_semantic_backbone
 
-                backbone = load_rwkv_semantic_backbone(
-                    args.rwkv_controller,
-                    graph,
-                    model_id=args.rwkv_model,
-                    device=args.rwkv_device,
-                    dtype=args.rwkv_dtype,
-                )
-                agent_runtime = SemanticWorkspaceAgent(
-                    graph,
-                    root,
-                    backbone,
-                    max_steps=args.max_steps,
-                    allow_docs=args.allow_docs,
-                )
-            else:
-                agent_runtime = SemanticWorkspaceAgent.from_artifact(
-                    graph,
-                    root,
-                    args.artifact,
-                    max_steps=args.max_steps,
-                    allow_docs=args.allow_docs,
-                )
+            backbone = load_rwkv_semantic_backbone(
+                args.rwkv_controller,
+                graph,
+                model_id=args.rwkv_model,
+                device=args.rwkv_device,
+                dtype=args.rwkv_dtype,
+            )
+            agent_runtime = SemanticWorkspaceAgent(
+                graph,
+                root,
+                backbone,
+                max_steps=args.max_steps,
+                allow_docs=args.allow_docs,
+            )
             episode = agent_runtime.run(args.goal, auto_approve=args.auto_approve)
             text = json.dumps(_safe(episode), indent=2, sort_keys=True, ensure_ascii=False)
             if args.output:

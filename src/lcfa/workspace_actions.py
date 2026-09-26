@@ -1,4 +1,4 @@
-"""Governed repository, terminal, test, git, and documentation actions."""
+"""Governed repository, terminal, test, verifier, git, and documentation actions."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -40,12 +40,19 @@ def _run(root: Path, argv: list[str], *, cwd: str | Path | None = None, timeout:
         raise WorkspaceActionError("argv must be a non-empty list of strings")
     workdir = _within(root, cwd or ".")
     proc = subprocess.run(
-        argv, cwd=workdir, text=True, capture_output=True,
-        timeout=max(1, min(int(timeout), 1800)), check=False,
+        argv,
+        cwd=workdir,
+        text=True,
+        capture_output=True,
+        timeout=max(1, min(int(timeout), 1800)),
+        check=False,
     )
     observation = {
-        "argv": argv, "cwd": str(workdir), "exit_code": proc.returncode,
-        "stdout": proc.stdout, "stderr": proc.stderr,
+        "argv": argv,
+        "cwd": str(workdir),
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
     }
     return ActionResult(value=observation, observations={"process": observation})
 
@@ -61,7 +68,12 @@ def _repo_read(context: ExecutionContext, inputs: Mapping[str, object]) -> Actio
     lines = text.splitlines()
     end = len(lines) if end_raw is None else min(len(lines), int(end_raw))
     selected = "\n".join(lines[start - 1:end])
-    value = {"path": str(path.relative_to(root)), "start_line": start, "end_line": end, "text": selected}
+    value = {
+        "path": str(path.relative_to(root)),
+        "start_line": start,
+        "end_line": end,
+        "text": selected,
+    }
     return ActionResult(value=value, observations={"file": value})
 
 
@@ -79,7 +91,9 @@ def _repo_search(context: ExecutionContext, inputs: Mapping[str, object]) -> Act
         if not path.is_file() or any(part in skip for part in path.relative_to(root).parts):
             continue
         try:
-            for number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1
+            ):
                 if query.lower() in line.lower():
                     hits.append({"path": str(path.relative_to(root)), "line": number, "text": line[:1000]})
                     if len(hits) >= limit:
@@ -101,7 +115,11 @@ def _repo_edit(context: ExecutionContext, inputs: Mapping[str, object]) -> Actio
     before = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    value = {"path": str(path.relative_to(root)), "bytes_before": len(before.encode()), "bytes_after": len(content.encode())}
+    value = {
+        "path": str(path.relative_to(root)),
+        "bytes_before": len(before.encode()),
+        "bytes_after": len(content.encode()),
+    }
     return ActionResult(value=value, observations={"edit": value})
 
 
@@ -122,7 +140,12 @@ def _repo_replace(context: ExecutionContext, inputs: Mapping[str, object]) -> Ac
         raise WorkspaceActionError(f"repo.replace requires exactly one match; found {count}")
     after = before.replace(old, new, 1)
     path.write_text(after, encoding="utf-8")
-    value = {"path": str(path.relative_to(root)), "replacements": 1, "bytes_before": len(before.encode()), "bytes_after": len(after.encode())}
+    value = {
+        "path": str(path.relative_to(root)),
+        "replacements": 1,
+        "bytes_before": len(before.encode()),
+        "bytes_after": len(after.encode()),
+    }
     return ActionResult(value=value, observations={"edit": value})
 
 
@@ -132,7 +155,12 @@ def _process_exec(context: ExecutionContext, inputs: Mapping[str, object]) -> Ac
     raw = inputs.get("argv")
     if not isinstance(raw, (list, tuple)):
         raise WorkspaceActionError("process.exec requires argv array; shell strings are intentionally unsupported")
-    return _run(_root(context), [str(item) for item in raw], cwd=inputs.get("cwd"), timeout=int(inputs.get("timeout", 120) or 120))
+    return _run(
+        _root(context),
+        [str(item) for item in raw],
+        cwd=inputs.get("cwd"),
+        timeout=int(inputs.get("timeout", 120) or 120),
+    )
 
 
 def _test_run(context: ExecutionContext, inputs: Mapping[str, object]) -> ActionResult:
@@ -142,8 +170,27 @@ def _test_run(context: ExecutionContext, inputs: Mapping[str, object]) -> Action
     argv = ["python", "-m", "pytest"]
     if target:
         argv.append(target)
-    argv.extend([str(item) for item in inputs.get("args", [])] if isinstance(inputs.get("args", []), (list, tuple)) else [])
-    return _run(_root(context), argv, cwd=inputs.get("cwd"), timeout=int(inputs.get("timeout", 600) or 600))
+    argv.extend(
+        [str(item) for item in inputs.get("args", [])]
+        if isinstance(inputs.get("args", []), (list, tuple))
+        else []
+    )
+    return _run(
+        _root(context),
+        argv,
+        cwd=inputs.get("cwd"),
+        timeout=int(inputs.get("timeout", 600) or 600),
+    )
+
+
+def _verify_run(context: ExecutionContext, inputs: Mapping[str, object]) -> ActionResult:
+    if "process.exec" not in context.capabilities:
+        raise WorkspaceActionError("verify.run requires process.exec capability")
+    raw = context.metadata.get("verify_argv")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise WorkspaceActionError("verify.run requires verify_argv in ExecutionContext.metadata")
+    timeout = int(inputs.get("timeout", context.metadata.get("verify_timeout", 600)) or 600)
+    return _run(_root(context), [str(item) for item in raw], timeout=timeout)
 
 
 def _git_status(context: ExecutionContext, inputs: Mapping[str, object]) -> ActionResult:
@@ -169,13 +216,19 @@ def _docs_fetch(context: ExecutionContext, inputs: Mapping[str, object]) -> Acti
     host = parsed.hostname.lower()
     if not allow or not any(host == domain or host.endswith("." + domain) for domain in allow):
         raise WorkspaceActionError(f"documentation host is not allowlisted: {host}")
-    forbidden = tuple(str(item).lower() for item in context.metadata.get(
-        "docs_forbidden_substrings", ("swe-bench", "/pull/", "/commit/", "gold.patch", "test.patch")
-    ))
+    forbidden = tuple(
+        str(item).lower()
+        for item in context.metadata.get(
+            "docs_forbidden_substrings",
+            ("swe-bench", "/pull/", "/commit/", "gold.patch", "test.patch"),
+        )
+    )
     if any(item and item in url.lower() for item in forbidden):
         raise WorkspaceActionError("documentation URL blocked by benchmark contamination policy")
     request = Request(url, headers={"User-Agent": "LCFA-Semantic-Runtime/0.1"})
-    with urlopen(request, timeout=max(1, min(int(inputs.get("timeout", 15) or 15), 60))) as response:
+    with urlopen(
+        request, timeout=max(1, min(int(inputs.get("timeout", 15) or 15), 60))
+    ) as response:
         max_bytes = max(1024, min(int(inputs.get("max_bytes", 2_000_000) or 2_000_000), 8_000_000))
         data = response.read(max_bytes + 1)
         if len(data) > max_bytes:
@@ -196,6 +249,7 @@ def register_workspace_actions(registry: ActionRegistry | None = None) -> Action
         ActionSpec("repo.replace", _repo_replace, effects=("filesystem.write",), description="Replace one exact text span in a workspace file."),
         ActionSpec("process.exec", _process_exec, effects=("process.exec",), description="Execute argv directly without a shell."),
         ActionSpec("test.run", _test_run, effects=("process.exec", "filesystem.write"), description="Run pytest in the workspace."),
+        ActionSpec("verify.run", _verify_run, effects=("process.exec",), description="Run the task verifier supplied by the environment."),
         ActionSpec("git.status", _git_status, description="Read repository status."),
         ActionSpec("git.diff", _git_diff, description="Read repository diff."),
         ActionSpec("docs.fetch", _docs_fetch, effects=("network.read",), description="Fetch allowlisted versioned documentation."),
@@ -214,6 +268,7 @@ _CAPABILITIES = {
     "repo.replace": ("workspace.write",),
     "process.exec": ("process.exec",),
     "test.run": ("process.exec",),
+    "verify.run": ("process.exec",),
     "docs.fetch": ("network.docs",),
 }
 
@@ -230,18 +285,26 @@ def compile_cognitive_actions(solution: SolutionState) -> ActionGraph:
             continue
         requires_approval = action in {"repo.edit", "repo.replace", "process.exec"}
         node_id = f"semantic-action-{index + 1}"
-        nodes.append(ActionNode(
-            id=node_id,
-            action=action,
-            inputs=dict(item.get("inputs", {})) if isinstance(item.get("inputs", {}), Mapping) else {},
-            effects=(),
-            required_capabilities=_CAPABILITIES.get(action, ()),
-            requires_approval=requires_approval,
-            approval_key=(f"approve:{node_id}" if requires_approval else None),
-            idempotency_key=f"{solution.id}:{index}:{action}",
-        ))
+        nodes.append(
+            ActionNode(
+                id=node_id,
+                action=action,
+                inputs=(
+                    dict(item.get("inputs", {}))
+                    if isinstance(item.get("inputs", {}), Mapping)
+                    else {}
+                ),
+                effects=(),
+                required_capabilities=_CAPABILITIES.get(action, ()),
+                requires_approval=requires_approval,
+                approval_key=(f"approve:{node_id}" if requires_approval else None),
+                idempotency_key=f"{solution.id}:{index}:{action}",
+            )
+        )
     return ActionGraph(
-        id=f"action-graph:{uuid4()}", source_solution_id=solution.id, nodes=tuple(nodes),
+        id=f"action-graph:{uuid4()}",
+        source_solution_id=solution.id,
+        nodes=tuple(nodes),
         metadata={"source": "semantic-runtime", "schema": "lcfa.semantic-actions.v1"},
     )
 
