@@ -5,6 +5,7 @@ from pathlib import Path
 
 from lcfa import (
     ACTION_VOCAB,
+    RECURRENT_TRANSITION_FORMAT,
     PythonRepoIndexer,
     RWKVSemanticBackbone,
     SQLiteSemanticGraph,
@@ -86,7 +87,7 @@ def test_prepare_transition_file_round_trips_jsonl(tmp_path: Path) -> None:
     assert rows[0].value_target == 0.0
     assert rows[-1].target_action == "stop"
     raw = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
-    assert raw["schema_version"] == "lcfa.recurrent-transition.v2"
+    assert raw["schema_version"] == RECURRENT_TRANSITION_FORMAT
 
 
 def test_legacy_transition_loader_strips_teacher_only_state(tmp_path: Path) -> None:
