@@ -4,10 +4,12 @@ from pathlib import Path
 
 from lcfa import (
     ActionExecutor,
+    BackboneSample,
     ExecutionContext,
     PythonRepoIndexer,
     SQLiteSemanticGraph,
     SemanticInvestigator,
+    SemanticWorkspaceAgent,
     compile_cognitive_actions,
     register_workspace_actions,
 )
@@ -83,3 +85,37 @@ def test_compiled_read_action_executes_through_governance(tmp_path: Path) -> Non
     assert run.results
     first = run.results[action_graph.nodes[0].id].value
     assert "path" in first or "hits" in first
+
+
+class _PolicyBackbone:
+    metadata = {"type": "semantic-test"}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def sample(self, **kwargs):
+        del kwargs
+        self.calls += 1
+        if self.calls == 1:
+            return (BackboneSample(
+                '{"hypothesis":{"claim":"Inspect normalize_name","confidence":0.8},'
+                '"action":{"name":"repo.read","inputs":{"path":"pkg/models.py"}},"final":false}'
+            ),)
+        return (BackboneSample(
+            '{"hypothesis":{"claim":"The implementation already handles None","confidence":0.95},'
+            '"action":null,"final":true}'
+        ),)
+
+
+def test_semantic_agent_records_content_addressed_observation_trajectory(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    with SQLiteSemanticGraph(tmp_path / ".lcfa" / "semantic.db") as graph:
+        PythonRepoIndexer(graph, tmp_path).index()
+        episode = SemanticWorkspaceAgent(
+            graph, tmp_path, _PolicyBackbone(), max_steps=3
+        ).run("Inspect Optional normalize_name behavior")
+        assert len(episode.steps) == 2
+        assert episode.steps[0].action["name"] == "repo.read"
+        assert episode.steps[0].observation["content_hash"].startswith("b3:")
+        assert episode.steps[-1].terminal is True
+        assert graph.search("agent step 1", kinds=("observation",), limit=5)
