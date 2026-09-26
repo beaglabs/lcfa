@@ -1,4 +1,4 @@
-"""CLI for LCFA recurrent-controller collection, datasets, training, and evaluation."""
+"""CLI for LCFA recurrent collection, datasets, training, and evaluation."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
-from .recurrent_collect import collect_trajectories
+from .recurrent_collect import COLLECTION_MODES, collect_trajectories
 from .recurrent_eval import evaluate_rwkv_heads
 from .recurrent_train import train_rwkv_heads
 from .recurrent_transitions import prepare_transition_file
@@ -17,16 +17,32 @@ from .rwkv_controller import DEFAULT_RWKV_MODEL
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lcfa-recurrent",
-        description="Collect/prepare LCFA trajectories and train/evaluate recurrent RWKV policy heads.",
+        description=(
+            "Collect oracle/RWKV trajectories and train/evaluate recurrent RWKV policy heads."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     collect = sub.add_parser(
         "collect",
-        help="run a semantic teacher over JSONL coding tasks in isolated git worktrees",
+        help="collect known-fix oracle trajectories or RWKV self-rollouts in isolated worktrees",
     )
-    collect.add_argument("tasks", help="JSONL tasks with repo, goal, base_ref, and verify_argv")
-    collect.add_argument("--artifact", required=True, help="semantic teacher stochastic artifact")
+    collect.add_argument(
+        "tasks",
+        help="JSONL tasks with repo, goal, base_ref, verify_argv, and optional fix_ref",
+    )
+    collect.add_argument("--mode", choices=COLLECTION_MODES, default="oracle")
+    collect.add_argument(
+        "--controller",
+        help="trained RWKV controller directory; required only for --mode rollout",
+    )
+    collect.add_argument("--model", help="override controller manifest RWKV model id")
+    collect.add_argument("--device", default="auto", help="auto, mps, cuda, cuda:N, or cpu")
+    collect.add_argument(
+        "--dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
     collect.add_argument("--output-dir", "-o", required=True)
     collect.add_argument("--worktree-root", default="/tmp/lcfa-recurrent-worktrees")
     collect.add_argument("--max-steps", type=int, default=12)
@@ -36,21 +52,31 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument(
         "--allow-baseline-pass",
         action="store_true",
-        help="collect tasks even when verify_argv already passes before the agent",
+        help="collect tasks even when verify_argv already passes before the repair",
     )
 
-    prepare = sub.add_parser("prepare", help="convert semantic episode JSON files into transition JSONL")
+    prepare = sub.add_parser(
+        "prepare",
+        help="convert semantic episode JSON files/directories into transition JSONL",
+    )
     prepare.add_argument("episodes", nargs="+")
     prepare.add_argument("--output", "-o", required=True)
 
-    train = sub.add_parser("train", help="train action/stop/value heads on frozen RWKV recurrent state")
+    train = sub.add_parser(
+        "train",
+        help="train action/stop/value heads on frozen RWKV recurrent state",
+    )
     train.add_argument("transitions")
     train.add_argument("--output-dir", "-o", required=True)
     train.add_argument("--model", default=DEFAULT_RWKV_MODEL)
     train.add_argument("--epochs", type=int, default=3)
     train.add_argument("--learning-rate", type=float, default=1e-3)
-    train.add_argument("--device")
-    train.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    train.add_argument("--device", default="auto", help="auto, mps, cuda, cuda:N, or cpu")
+    train.add_argument(
+        "--dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
     train.add_argument(
         "--validation-fraction",
         type=float,
@@ -66,8 +92,12 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("transitions")
     evaluate.add_argument("--controller", required=True)
     evaluate.add_argument("--model", help="override controller manifest model_id")
-    evaluate.add_argument("--device")
-    evaluate.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    evaluate.add_argument("--device", default="auto", help="auto, mps, cuda, cuda:N, or cpu")
+    evaluate.add_argument(
+        "--dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
     evaluate.add_argument("--output", "-o")
     return parser
 
@@ -76,15 +106,20 @@ def _collection_progress(event: Mapping[str, Any]) -> None:
     index = event.get("index", "?")
     total = event.get("total", "?")
     task_id = event.get("task_id", "?")
+    mode = event.get("mode", "?")
     if event.get("event") == "task-start":
-        print(f"[lcfa] collect {index}/{total} {task_id} start", file=sys.stderr, flush=True)
+        print(
+            f"[lcfa] collect[{mode}] {index}/{total} {task_id} start",
+            file=sys.stderr,
+            flush=True,
+        )
         return
     status = event.get("status", "unknown")
     success = event.get("success")
     steps = event.get("steps", 0)
     elapsed = float(event.get("elapsed_seconds", 0.0) or 0.0)
     print(
-        f"[lcfa] collect {index}/{total} {task_id} done status={status} "
+        f"[lcfa] collect[{mode}] {index}/{total} {task_id} done status={status} "
         f"success={success} steps={steps} elapsed={elapsed:.1f}s",
         file=sys.stderr,
         flush=True,
@@ -92,11 +127,18 @@ def _collection_progress(event: Mapping[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     if args.command == "collect":
+        if args.mode == "rollout" and not args.controller:
+            parser.error("lcfa-recurrent collect --mode rollout requires --controller")
         summary = collect_trajectories(
             args.tasks,
-            artifact=args.artifact,
+            mode=args.mode,
+            controller=args.controller,
+            model_id=args.model,
+            device=args.device,
+            dtype=args.dtype,
             output_dir=args.output_dir,
             worktree_root=args.worktree_root,
             max_steps=args.max_steps,
