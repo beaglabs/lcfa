@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .artifact import load_artifact_reasoner
 from .engine import LCFA
@@ -323,6 +323,7 @@ def collect_trajectories(
     keep_worktrees: bool = False,
     require_baseline_failure: bool = True,
     max_tasks: int | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Mapping[str, Any]:
     tasks = list(load_tasks(tasks_path))
     if max_tasks is not None:
@@ -340,8 +341,12 @@ def collect_trajectories(
     worktrees.mkdir(parents=True, exist_ok=True)
     teacher = _TeacherBackboneCache(artifact_path)
 
-    results = [
-        _collect_one(
+    results: list[CollectionTaskResult] = []
+    total = len(tasks)
+    for index, task in enumerate(tasks, start=1):
+        if progress is not None:
+            progress({"event": "task-start", "index": index, "total": total, "task_id": task.id})
+        result = _collect_one(
             task,
             teacher=teacher,
             artifact=artifact_path,
@@ -352,8 +357,19 @@ def collect_trajectories(
             keep_worktrees=keep_worktrees,
             require_baseline_failure=require_baseline_failure,
         )
-        for task in tasks
-    ]
+        results.append(result)
+        if progress is not None:
+            progress({
+                "event": "task-done",
+                "index": index,
+                "total": total,
+                "task_id": task.id,
+                "status": result.status,
+                "success": result.success,
+                "steps": result.steps,
+                "elapsed_seconds": result.elapsed_seconds,
+            })
+
     collected = [item for item in results if item.status == "collected"]
     successful = [item for item in collected if item.success]
     summary = {
