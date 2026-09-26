@@ -10,6 +10,7 @@ from typing import Any, Mapping, Protocol, Sequence
 import numpy as np
 from blake3 import blake3
 
+from .model_policy import UnsupportedModelError, reject_qwen_model
 from .protocol import EntityRef, EvidenceRef
 
 ZPLUG_FORMAT = "lcfa.zplug.v1"
@@ -192,16 +193,15 @@ def _rounded_pad_length(length: int, *, pad_to: int, max_tokens: int) -> int:
 
 
 class MLXTextZPlug:
-    """Frozen local MLX-LM hidden-state text enricher.
-
-    Hidden-state extraction supports right-padded batches. Padding is rounded to
-    a small fixed bucket size to reduce Metal graph shape churn during large
-    feature-cache jobs. Generation remains entirely outside this path.
-    """
+    """Frozen local MLX-LM hidden-state text enricher for supported model families."""
 
     def __init__(self, model_path: str | Path, *, max_tokens: int = 2048,
                  pool: str = "last", normalize: bool = True, pad_to: int = 32,
                  plug_id: str = "lcfa.text.mlx-hidden") -> None:
+        try:
+            reject_qwen_model(model_path)
+        except UnsupportedModelError as exc:
+            raise ZPlugError(str(exc)) from exc
         try:
             import mlx.core as mx
             from mlx_lm import load
