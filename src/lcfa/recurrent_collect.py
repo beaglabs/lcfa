@@ -1,22 +1,17 @@
 """Collect LCFA recurrent trajectories without a language-model teacher.
 
-Two collection modes are supported:
+``oracle`` bootstraps from historical issue/fix pairs, but the fixed commit is
+used only for edit labels. Search queries and files inspected by the oracle are
+chosen by the same base-repository retriever used during live rollout.
 
-``oracle``
-    Bootstrap from a historical buggy commit plus a known fixed commit. LCFA
-    deterministically replays typed search/read/edit/verify actions and only
-    saves the episode when the external verifier passes.
-
-``rollout``
-    Let a trained RWKV recurrent controller act in the isolated worktree, then
-    attach verifier success/failure as the external value label.
+``rollout`` lets a trained RWKV recurrent controller act in an isolated
+worktree and attaches external verifier success/failure as the value label.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import time
@@ -25,7 +20,9 @@ from uuid import uuid4
 
 from .engine import LCFA
 from .protocol import ActionGraph, ActionNode, ExecutionContext, SolutionState
+from .repair_supervision import historical_repair_targets
 from .repo_index import PythonRepoIndexer
+from .repo_retrieval import build_retrieval_context
 from .rwkv_controller import RWKVRecurrentPolicy, load_rwkv_policy
 from .rwkv_semantic import RWKVSemanticBackbone
 from .semantic_agent import SemanticAgentEpisode, SemanticAgentStep, SemanticWorkspaceAgent
@@ -33,10 +30,11 @@ from .semantic_graph import SQLiteSemanticGraph
 from .workspace_actions import register_workspace_actions
 
 
-COLLECTION_FORMAT = "lcfa.recurrent-collection.v2"
+COLLECTION_FORMAT = "lcfa.recurrent-collection.v3"
 TASK_FORMAT = "lcfa.recurrent-task.v2"
 LEGACY_TASK_FORMAT = "lcfa.recurrent-task.v1"
 COLLECTION_MODES = ("oracle", "rollout")
+ORACLE_MAX_READS = 5
 
 
 class CollectionError(RuntimeError):
@@ -189,24 +187,6 @@ def _git(repo: Path, *args: str, timeout: int = 60) -> str:
     return result.stdout.strip()
 
 
-def _git_show(repo: Path, ref: str, path: str) -> str:
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{path}"],
-        cwd=repo,
-        capture_output=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise CollectionError(
-            f"git show {ref}:{path} failed: "
-            f"{result.stderr.decode(errors='replace').strip()}"
-        )
-    try:
-        return result.stdout.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise CollectionError(f"oracle trajectory only supports UTF-8 text files: {path}") from exc
-
-
 def _verify_repo(repo: Path) -> None:
     if not repo.exists() or not repo.is_dir():
         raise CollectionError(f"repository does not exist: {repo}")
@@ -268,8 +248,6 @@ def _add_worktree(source_repo: Path, worktree: Path, ref: str) -> str:
     if worktree.exists():
         shutil.rmtree(worktree)
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    # /tmp may be removed independently of Git's administrative worktree entry.
-    # Prune those stale registrations before recreating the collector-owned path.
     _git(source_repo, "worktree", "prune", timeout=30)
     resolved = _git(source_repo, "rev-parse", ref)
     _git(
@@ -304,50 +282,6 @@ def _remove_worktree(source_repo: Path, worktree: Path) -> None:
             capture_output=True,
             timeout=30,
         )
-
-
-def _changed_text_paths(repo: Path, base_commit: str, fix_commit: str) -> tuple[str, ...]:
-    raw = _git(
-        repo,
-        "diff",
-        "--name-status",
-        "--diff-filter=ACM",
-        base_commit,
-        fix_commit,
-        "--",
-    )
-    paths: list[str] = []
-    for line in raw.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 2 or parts[0] not in {"A", "C", "M"}:
-            continue
-        paths.append(parts[1])
-    return tuple(paths)
-
-
-def _has_unsupported_oracle_changes(repo: Path, base_commit: str, fix_commit: str) -> bool:
-    raw = _git(repo, "diff", "--name-status", base_commit, fix_commit, "--")
-    return any(line and line[0] in {"D", "R", "T", "U"} for line in raw.splitlines())
-
-
-def _oracle_search_query(goal: str, paths: Sequence[str], worktree: Path) -> str:
-    stop = {
-        "this", "that", "with", "from", "into", "when", "then", "make", "support",
-        "enable", "using", "should", "file", "model", "loader", "recurrent", "controller",
-    }
-    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", goal)
-    candidates = [item for item in tokens if item.casefold() not in stop]
-    for token in candidates:
-        needle = token.casefold()
-        for raw_path in paths:
-            path = worktree / raw_path
-            if path.is_file():
-                text = path.read_text(encoding="utf-8", errors="ignore").casefold()
-                if needle in text:
-                    return token
-    if paths:
-        return Path(paths[0]).stem
-    return candidates[0] if candidates else goal[:80]
 
 
 def _oracle_action(
@@ -392,15 +326,23 @@ def _oracle_episode(
     worktree: Path,
     base_commit: str,
     fix_commit: str,
-) -> tuple[SemanticAgentEpisode, VerificationResult]:
-    if _has_unsupported_oracle_changes(source_repo, base_commit, fix_commit):
+) -> tuple[SemanticAgentEpisode, VerificationResult, Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
+    repair_targets = historical_repair_targets(source_repo, base_commit, fix_commit)
+    db_path = worktree / ".lcfa" / "semantic.db"
+    with SQLiteSemanticGraph(db_path) as graph:
+        PythonRepoIndexer(graph, worktree).index()
+        retrieval = build_retrieval_context(graph, task.goal)
+
+    existing_gold = {
+        target.path for target in repair_targets if (worktree / target.path).is_file()
+    }
+    inspected_paths = retrieval.candidate_paths[:ORACLE_MAX_READS]
+    missing = sorted(existing_gold - set(inspected_paths))
+    if missing:
         raise CollectionError(
-            "oracle bootstrap currently supports added/modified text files only; "
-            "delete/rename/type-change diffs must use rollout mode or be normalized first"
+            "base-repository retriever missed historically changed file(s) within "
+            f"top {ORACLE_MAX_READS}: {missing}; refusing gold-path localization leakage"
         )
-    paths = _changed_text_paths(source_repo, base_commit, fix_commit)
-    if not paths:
-        raise CollectionError("oracle fix_ref contains no added/modified files")
 
     executor = LCFA(actions=register_workspace_actions()).agentic
     solution = SolutionState(
@@ -410,107 +352,108 @@ def _oracle_episode(
     )
     steps: list[SemanticAgentStep] = []
 
-    def append(action: str | None, inputs: Mapping[str, Any], observation: Mapping[str, Any], claim: str, *, terminal: bool = False) -> None:
+    def append(
+        action: str | None,
+        inputs: Mapping[str, Any],
+        observation: Mapping[str, Any],
+        claim: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
         index = len(steps) + 1
-        steps.append(
-            SemanticAgentStep(
-                index=index,
-                solution_id=f"{solution.id}:{index}",
-                hypothesis={"claim": claim, "confidence": 1.0},
-                action=({"name": action, "inputs": dict(inputs)} if action else None),
-                observation=dict(observation),
-                terminal=terminal,
-            )
-        )
+        steps.append(SemanticAgentStep(
+            index=index,
+            solution_id=f"{solution.id}:{index}",
+            hypothesis={"claim": claim, "confidence": 1.0},
+            action=({"name": action, "inputs": dict(inputs)} if action else None),
+            observation=dict(observation),
+            terminal=terminal,
+        ))
 
-    query = _oracle_search_query(task.goal, paths, worktree)
-    inputs = {"query": query}
+    query = retrieval.queries[0] if retrieval.queries else task.goal
+    search_inputs = {"query": query}
     append(
         "repo.search",
-        inputs,
+        search_inputs,
         _oracle_action(
             executor,
             worktree,
             solution,
             action="repo.search",
-            inputs=inputs,
+            inputs=search_inputs,
             verify_argv=task.verify_argv,
             verify_timeout=task.timeout_seconds,
         ),
-        f"Locate repository evidence related to {query}",
+        f"Locate base-repository evidence for {query}",
     )
 
-    for path in paths:
+    for path in inspected_paths:
         existing = worktree / path
-        if existing.is_file():
-            inputs = {"path": path}
-            append(
-                "repo.read",
-                inputs,
-                _oracle_action(
-                    executor,
-                    worktree,
-                    solution,
-                    action="repo.read",
-                    inputs=inputs,
-                    verify_argv=task.verify_argv,
-                    verify_timeout=task.timeout_seconds,
-                ),
-                f"Inspect affected file {path}",
-            )
-
-    for path in paths:
-        fixed = _git_show(source_repo, fix_commit, path)
-        inputs = {"path": path, "content": fixed}
+        if not existing.is_file():
+            continue
+        read_inputs = {"path": path}
         append(
-            "repo.edit",
+            "repo.read",
+            read_inputs,
+            _oracle_action(
+                executor,
+                worktree,
+                solution,
+                action="repo.read",
+                inputs=read_inputs,
+                verify_argv=task.verify_argv,
+                verify_timeout=task.timeout_seconds,
+            ),
+            f"Inspect retriever-ranked candidate {path}",
+        )
+
+    for target in repair_targets:
+        inputs = dict(target.inputs)
+        append(
+            target.action,
             inputs,
             _oracle_action(
                 executor,
                 worktree,
                 solution,
-                action="repo.edit",
+                action=target.action,
                 inputs=inputs,
                 verify_argv=task.verify_argv,
                 verify_timeout=task.timeout_seconds,
             ),
-            f"Apply the externally verified historical repair to {path}",
+            f"Apply historically verified repair span to {target.path}",
         )
 
     verify_inputs: Mapping[str, Any] = {}
-    verify_observation = _oracle_action(
-        executor,
-        worktree,
-        solution,
-        action="verify.run",
-        inputs=verify_inputs,
-        verify_argv=task.verify_argv,
-        verify_timeout=task.timeout_seconds,
-    )
     append(
         "verify.run",
         verify_inputs,
-        verify_observation,
+        _oracle_action(
+            executor,
+            worktree,
+            solution,
+            action="verify.run",
+            inputs=verify_inputs,
+            verify_argv=task.verify_argv,
+            verify_timeout=task.timeout_seconds,
+        ),
         "Run the task verifier after applying the repair",
     )
     verification = _run(task.verify_argv, worktree, task.timeout_seconds)
-    append(
-        None,
-        {},
-        {},
-        "Stop only after the external verifier confirms the repair",
-        terminal=True,
-    )
+    append(None, {}, {}, "Stop only after the external verifier confirms the repair", terminal=True)
     patch = _git(worktree, "diff", "--no-ext-diff")
+    episode = SemanticAgentEpisode(
+        id=f"semantic-episode:oracle:{_safe_id(task.id)}:{uuid4().hex[:12]}",
+        goal=task.goal,
+        steps=tuple(steps),
+        final_solution_id=steps[-1].solution_id,
+        patch=patch,
+    )
     return (
-        SemanticAgentEpisode(
-            id=f"semantic-episode:oracle:{_safe_id(task.id)}:{uuid4().hex[:12]}",
-            goal=task.goal,
-            steps=tuple(steps),
-            final_solution_id=steps[-1].solution_id,
-            patch=patch,
-        ),
+        episode,
         verification,
+        retrieval.to_dict(),
+        tuple(target.to_dict() for target in repair_targets),
     )
 
 
@@ -527,15 +470,8 @@ def _collect_one_oracle(
     _verify_repo(source_repo)
     if not task.fix_ref:
         return CollectionTaskResult(
-            task.id,
-            "missing-fix-ref",
-            None,
-            None,
-            None,
-            0,
-            0,
-            time.monotonic() - started,
-            error="oracle mode requires fix_ref",
+            task.id, "missing-fix-ref", None, None, None, 0, 0,
+            time.monotonic() - started, error="oracle mode requires fix_ref",
         )
     task_name = _safe_id(task.id)
     worktree = worktree_root / task_name
@@ -547,29 +483,17 @@ def _collect_one_oracle(
             setup = _run(task.setup_argv, worktree, task.timeout_seconds)
             if not setup.passed:
                 return CollectionTaskResult(
-                    task.id,
-                    "setup-failed",
-                    None,
-                    None,
-                    None,
-                    0,
-                    0,
+                    task.id, "setup-failed", None, None, None, 0, 0,
                     time.monotonic() - started,
                     error=f"setup failed: {_clip(setup.stderr or setup.stdout, 2000)}",
                 )
         baseline = _run(task.verify_argv, worktree, task.timeout_seconds)
         if require_baseline_failure and baseline.passed:
             return CollectionTaskResult(
-                task.id,
-                "baseline-already-passes",
-                None,
-                None,
-                True,
-                0,
-                0,
+                task.id, "baseline-already-passes", None, None, True, 0, 0,
                 time.monotonic() - started,
             )
-        episode, verification = _oracle_episode(
+        episode, verification, retrieval, repairs = _oracle_episode(
             task,
             source_repo=source_repo,
             worktree=worktree,
@@ -578,13 +502,8 @@ def _collect_one_oracle(
         )
         if not verification.passed:
             return CollectionTaskResult(
-                task.id,
-                "oracle-verification-failed",
-                None,
-                False,
-                baseline.passed,
-                len(episode.patch.encode("utf-8")),
-                len(episode.steps),
+                task.id, "oracle-verification-failed", None, False, baseline.passed,
+                len(episode.patch.encode("utf-8")), len(episode.steps),
                 time.monotonic() - started,
                 error=_clip(verification.stderr or verification.stdout, 2000),
             )
@@ -602,6 +521,9 @@ def _collect_one_oracle(
             "fix_commit": fix_commit,
             "baseline": _verification_dict(baseline),
             "verification": _verification_dict(verification),
+            "retrieval": retrieval,
+            "repair_targets": list(repairs),
+            "gold_used_for_localization": False,
         }
         output_dir.mkdir(parents=True, exist_ok=True)
         episode_path.write_text(
@@ -609,24 +531,13 @@ def _collect_one_oracle(
             encoding="utf-8",
         )
         return CollectionTaskResult(
-            task.id,
-            "collected",
-            str(episode_path),
-            True,
-            baseline.passed,
-            len(episode.patch.encode("utf-8")),
-            len(episode.steps),
+            task.id, "collected", str(episode_path), True, baseline.passed,
+            len(episode.patch.encode("utf-8")), len(episode.steps),
             time.monotonic() - started,
         )
     except Exception as exc:
         return CollectionTaskResult(
-            task.id,
-            "error",
-            None,
-            None,
-            None,
-            0,
-            0,
+            task.id, "error", None, None, None, 0, 0,
             time.monotonic() - started,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -655,36 +566,26 @@ def _collect_one_rollout(
     episode_path = output_dir / f"{task_name}.json"
     base_commit = _add_worktree(source_repo, worktree, task.base_ref)
     try:
+        fix_commit = _git(source_repo, "rev-parse", task.fix_ref) if task.fix_ref else None
         if task.setup_argv:
             setup = _run(task.setup_argv, worktree, task.timeout_seconds)
             if not setup.passed:
                 return CollectionTaskResult(
-                    task.id,
-                    "setup-failed",
-                    None,
-                    None,
-                    None,
-                    0,
-                    0,
+                    task.id, "setup-failed", None, None, None, 0, 0,
                     time.monotonic() - started,
                     error=f"setup failed: {_clip(setup.stderr or setup.stdout, 2000)}",
                 )
         baseline = _run(task.verify_argv, worktree, task.timeout_seconds)
         if require_baseline_failure and baseline.passed:
             return CollectionTaskResult(
-                task.id,
-                "baseline-already-passes",
-                None,
-                None,
-                True,
-                0,
-                0,
+                task.id, "baseline-already-passes", None, None, True, 0, 0,
                 time.monotonic() - started,
             )
 
         db_path = worktree / ".lcfa" / "semantic.db"
         with SQLiteSemanticGraph(db_path) as graph:
             PythonRepoIndexer(graph, worktree).index()
+            retrieval = build_retrieval_context(graph, task.goal)
             agent = SemanticWorkspaceAgent(
                 graph,
                 worktree,
@@ -707,12 +608,15 @@ def _collect_one_rollout(
             "repo": str(source_repo),
             "base_ref": task.base_ref,
             "base_commit": base_commit,
+            "fix_ref": task.fix_ref,
+            "fix_commit": fix_commit,
             "baseline": _verification_dict(baseline),
             "verification": _verification_dict(verification),
             "controller": str(controller),
             "controller_runtime": dict(policy.metadata),
             "max_steps": max_steps,
             "allow_docs": allow_docs,
+            "retrieval": retrieval.to_dict(),
         }
         output_dir.mkdir(parents=True, exist_ok=True)
         episode_path.write_text(
@@ -720,24 +624,13 @@ def _collect_one_rollout(
             encoding="utf-8",
         )
         return CollectionTaskResult(
-            task.id,
-            "collected",
-            str(episode_path),
-            verification.passed,
-            baseline.passed,
-            len(episode.patch.encode("utf-8")),
-            len(episode.steps),
+            task.id, "collected", str(episode_path), verification.passed, baseline.passed,
+            len(episode.patch.encode("utf-8")), len(episode.steps),
             time.monotonic() - started,
         )
     except Exception as exc:
         return CollectionTaskResult(
-            task.id,
-            "error",
-            None,
-            None,
-            None,
-            0,
-            0,
+            task.id, "error", None, None, None, 0, 0,
             time.monotonic() - started,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -797,11 +690,8 @@ def collect_trajectories(
     for index, task in enumerate(tasks, start=1):
         if progress is not None:
             progress({
-                "event": "task-start",
-                "index": index,
-                "total": total,
-                "task_id": task.id,
-                "mode": resolved_mode,
+                "event": "task-start", "index": index, "total": total,
+                "task_id": task.id, "mode": resolved_mode,
             })
         if resolved_mode == "oracle":
             result = _collect_one_oracle(
@@ -827,24 +717,16 @@ def collect_trajectories(
         results.append(result)
         if progress is not None:
             progress({
-                "event": "task-done",
-                "index": index,
-                "total": total,
-                "task_id": task.id,
-                "mode": resolved_mode,
-                "status": result.status,
-                "success": result.success,
-                "steps": result.steps,
-                "elapsed_seconds": result.elapsed_seconds,
+                "event": "task-done", "index": index, "total": total,
+                "task_id": task.id, "mode": resolved_mode,
+                "status": result.status, "success": result.success,
+                "steps": result.steps, "elapsed_seconds": result.elapsed_seconds,
             })
 
     collected = [item for item in results if item.status == "collected"]
     successful = [item for item in collected if item.success]
     error_statuses = {
-        "error",
-        "setup-failed",
-        "missing-fix-ref",
-        "oracle-verification-failed",
+        "error", "setup-failed", "missing-fix-ref", "oracle-verification-failed",
     }
     summary = {
         "format": COLLECTION_FORMAT,

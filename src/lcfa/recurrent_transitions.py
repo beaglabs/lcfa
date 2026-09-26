@@ -1,15 +1,8 @@
 """Transition datasets for training recurrent LCFA controllers.
 
-The semantic agent records ``lcfa.semantic-trajectory.v1`` episodes. This
-module turns those episodes into one-step supervision records suitable for a
-recurrent controller: event_t -> action_t / stop_t / value_t.
-
-The controller event stream intentionally excludes teacher/oracle hypotheses
-and semantic cognition snapshots. Action supervision may only depend on the
-goal plus prior actions/observations that are also available during rollout.
-Large write payloads and observations are compacted before they are fed back
-through RWKV so recurrent state does not repeatedly tokenize whole files,
-diffs, or process logs.
+The event stream contains only information available during rollout: the goal,
+a compact shared retrieval context, and prior action/observation pairs. Action
+supervision separately retains target inputs and optional candidate pointers.
 """
 from __future__ import annotations
 
@@ -19,11 +12,35 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+# One bundled historical verifier imports this module directly by file path.
+# Keep that compatibility: retrieval supervision is optional for such legacy
+# episodes and package-relative helpers must not make the module unimportable.
+try:
+    from .repo_retrieval import pointer_for_action, retrieval_from_mapping
+except ImportError:  # pragma: no cover - exercised by detached historical verifier
+    def retrieval_from_mapping(value: Mapping[str, Any] | None) -> None:
+        del value
+        return None
 
-RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v2"
-LEGACY_RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v1"
+    def pointer_for_action(
+        action: str,
+        inputs: Mapping[str, Any],
+        retrieval: Any,
+    ) -> None:
+        del action, inputs, retrieval
+        return None
+
+
+RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v3"
+LEGACY_RECURRENT_TRANSITION_FORMATS = (
+    "lcfa.recurrent-transition.v1",
+    "lcfa.recurrent-transition.v2",
+)
+LEGACY_RECURRENT_TRANSITION_FORMAT = LEGACY_RECURRENT_TRANSITION_FORMATS[0]
 MAX_RECURRENT_TEXT_CHARS = 4096
 MAX_RECURRENT_SEQUENCE_ITEMS = 24
+MAX_RETRIEVAL_QUERIES_IN_EVENT = 8
+MAX_RETRIEVAL_PATHS_IN_EVENT = 16
 
 ACTION_VOCAB: tuple[str, ...] = (
     "repo.read",
@@ -50,6 +67,10 @@ class RecurrentTransition:
     stop_target: bool
     value_target: float | None = None
     metadata: Mapping[str, Any] | None = None
+    target_inputs: Mapping[str, Any] | None = None
+    target_pointer: int | None = None
+    candidate_queries: tuple[str, ...] = ()
+    candidate_paths: tuple[str, ...] = ()
     schema_version: str = RECURRENT_TRANSITION_FORMAT
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -62,10 +83,7 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 def _text_summary(value: str) -> Mapping[str, Any]:
     raw = value.encode("utf-8")
-    return {
-        "bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-    }
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def _compact_text(value: str) -> str | Mapping[str, Any]:
@@ -84,7 +102,6 @@ def _compact_text(value: str) -> str | Mapping[str, Any]:
 
 
 def _compact_value(value: Any, *, depth: int = 0) -> Any:
-    """Bound arbitrary action observations while preserving useful evidence."""
     if isinstance(value, str):
         return _compact_text(value)
     if isinstance(value, Mapping):
@@ -103,21 +120,11 @@ def _compact_value(value: Any, *, depth: int = 0) -> Any:
         ]
         if len(items) <= MAX_RECURRENT_SEQUENCE_ITEMS:
             return compacted
-        return {
-            "items": compacted,
-            "total_items": len(items),
-            "truncated": True,
-        }
+        return {"items": compacted, "total_items": len(items), "truncated": True}
     return value
 
 
 def compact_action(action: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
-    """Return an action representation safe to feed back into recurrent state.
-
-    Read/search/test actions retain their inputs. Write actions keep their
-    semantic target and fingerprints of the written text, but not the complete
-    source body.
-    """
     if not isinstance(action, Mapping):
         return None
     name = str(action.get("name") or "")
@@ -138,10 +145,7 @@ def compact_action(action: Mapping[str, Any] | None) -> Mapping[str, Any] | None
     return {"name": name, "inputs": _compact_value(inputs)}
 
 
-def _named_observation(
-    observation: Mapping[str, Any],
-    key: str,
-) -> Any | None:
+def _named_observation(observation: Mapping[str, Any], key: str) -> Any | None:
     nested = observation.get("observations")
     if isinstance(nested, Mapping) and key in nested:
         return nested[key]
@@ -157,13 +161,6 @@ def compact_observation(
     action: Mapping[str, Any] | None,
     observation: Mapping[str, Any] | None,
 ) -> Mapping[str, Any]:
-    """Deduplicate executor envelopes and bound recurrent observation size.
-
-    Oracle/executor observations can contain the same payload in both
-    ``results`` and ``observations``. The recurrent controller only needs one
-    semantic copy. Workspace actions themselves still retain their full output;
-    this compaction affects only the RWKV event stream.
-    """
     if not isinstance(observation, Mapping):
         return {}
     action_name = str(action.get("name") or "") if isinstance(action, Mapping) else ""
@@ -184,17 +181,47 @@ def compact_observation(
     return dict(_compact_value(observation))
 
 
-def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the rollout-available, bounded recurrent event schema.
+def _retrieval_summary(value: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    raw_queries = value.get("queries", ())
+    queries = (
+        [str(item) for item in raw_queries[:MAX_RETRIEVAL_QUERIES_IN_EVENT]]
+        if isinstance(raw_queries, Sequence) and not isinstance(raw_queries, (str, bytes))
+        else []
+    )
+    raw_paths = value.get("paths", ())
+    if not raw_paths:
+        candidates = value.get("candidates", ())
+        if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+            raw_paths = [
+                str(item.get("path"))
+                for item in candidates
+                if isinstance(item, Mapping) and item.get("path")
+            ]
+    paths = (
+        [str(item) for item in raw_paths[:MAX_RETRIEVAL_PATHS_IN_EVENT]]
+        if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes))
+        else []
+    )
+    if not queries and not paths:
+        return None
+    return {"queries": queries, "paths": paths}
 
-    Legacy datasets may contain ``hypothesis`` or ``cognition`` fields. They
-    are stripped at load time so old files cannot accidentally reintroduce
-    teacher information into training. Training and live rollout call this same
-    function, so their recurrent input schema remains identical.
-    """
+
+def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
     kind = str(event.get("kind") or "")
     if kind == "goal":
-        return {"kind": "goal", "goal": _compact_text(str(event.get("goal") or ""))}
+        out: dict[str, Any] = {
+            "kind": "goal",
+            "goal": _compact_text(str(event.get("goal") or "")),
+        }
+        retrieval = _retrieval_summary(
+            event.get("retrieval") if isinstance(event.get("retrieval"), Mapping) else None
+        )
+        if retrieval is not None:
+            out["retrieval"] = retrieval
+        return out
     if kind == "transition":
         raw_action = event.get("action") if isinstance(event.get("action"), Mapping) else None
         observation = event.get("observation")
@@ -211,11 +238,6 @@ def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _episode_success(episode: Mapping[str, Any]) -> float | None:
-    """Read an optional externally supplied benchmark outcome.
-
-    We never infer success from ``final`` or from producing a patch. A value
-    target is valid only when a grader/caller explicitly attaches one.
-    """
     for key in ("success", "resolved"):
         if key in episode:
             value = episode[key]
@@ -243,6 +265,10 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
     if not isinstance(steps_raw, Sequence) or isinstance(steps_raw, (str, bytes)):
         raise ValueError("semantic episode steps must be an array")
 
+    episode_metadata = _mapping(episode.get("metadata"))
+    retrieval = retrieval_from_mapping(_mapping(episode_metadata.get("retrieval")))
+    candidate_queries = retrieval.queries if retrieval is not None else ()
+    candidate_paths = retrieval.candidate_paths if retrieval is not None else ()
     value_target = _episode_success(episode)
     previous_action: Mapping[str, Any] | None = None
     previous_observation: Mapping[str, Any] = {}
@@ -254,9 +280,16 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         if action_name not in ACTION_VOCAB:
             raise ValueError(f"unsupported recurrent target action: {action_name}")
         terminal = bool(step.get("terminal", False))
+        inputs = dict(_mapping(action.get("inputs"))) if action else {}
 
         if position == 1:
-            event: Mapping[str, Any] = normalize_event({"kind": "goal", "goal": goal})
+            goal_event: dict[str, Any] = {"kind": "goal", "goal": goal}
+            if candidate_queries or candidate_paths:
+                goal_event["retrieval"] = {
+                    "queries": list(candidate_queries),
+                    "paths": list(candidate_paths),
+                }
+            event: Mapping[str, Any] = normalize_event(goal_event)
         else:
             event = normalize_event({
                 "kind": "transition",
@@ -264,18 +297,20 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
                 "observation": dict(previous_observation),
             })
 
-        out.append(
-            RecurrentTransition(
-                episode_id=episode_id,
-                step_index=int(step.get("index", position)),
-                goal=goal,
-                event=event,
-                target_action=action_name,
-                stop_target=terminal,
-                value_target=value_target,
-                metadata={"has_observation": bool(step.get("observation"))},
-            )
-        )
+        out.append(RecurrentTransition(
+            episode_id=episode_id,
+            step_index=int(step.get("index", position)),
+            goal=goal,
+            event=event,
+            target_action=action_name,
+            stop_target=terminal,
+            value_target=value_target,
+            metadata={"has_observation": bool(step.get("observation"))},
+            target_inputs=inputs,
+            target_pointer=pointer_for_action(action_name, inputs, retrieval),
+            candidate_queries=tuple(candidate_queries),
+            candidate_paths=tuple(candidate_paths),
+        ))
         previous_action = dict(action) if action else None
         previous_observation = dict(_mapping(step.get("observation")))
     return tuple(out)
@@ -299,30 +334,35 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
             if not isinstance(raw, Mapping):
                 raise ValueError(f"transition line {line_number} is not an object")
             schema = str(raw.get("schema_version", ""))
-            if schema not in {
-                RECURRENT_TRANSITION_FORMAT,
-                LEGACY_RECURRENT_TRANSITION_FORMAT,
-            }:
-                raise ValueError(
-                    f"transition line {line_number} has wrong schema_version"
-                )
-            rows.append(
-                RecurrentTransition(
-                    episode_id=str(raw["episode_id"]),
-                    step_index=int(raw["step_index"]),
-                    goal=str(raw["goal"]),
-                    event=normalize_event(dict(_mapping(raw.get("event")))),
-                    target_action=str(raw["target_action"]),
-                    stop_target=bool(raw["stop_target"]),
-                    value_target=(
-                        None if raw.get("value_target") is None else float(raw["value_target"])
-                    ),
-                    metadata={
-                        **dict(_mapping(raw.get("metadata"))),
-                        "source_transition_format": schema,
-                    },
-                )
-            )
+            if schema not in {RECURRENT_TRANSITION_FORMAT, *LEGACY_RECURRENT_TRANSITION_FORMATS}:
+                raise ValueError(f"transition line {line_number} has wrong schema_version")
+            raw_queries = raw.get("candidate_queries", ())
+            raw_paths = raw.get("candidate_paths", ())
+            rows.append(RecurrentTransition(
+                episode_id=str(raw["episode_id"]),
+                step_index=int(raw["step_index"]),
+                goal=str(raw["goal"]),
+                event=normalize_event(dict(_mapping(raw.get("event")))),
+                target_action=str(raw["target_action"]),
+                stop_target=bool(raw["stop_target"]),
+                value_target=(None if raw.get("value_target") is None else float(raw["value_target"])),
+                metadata={
+                    **dict(_mapping(raw.get("metadata"))),
+                    "source_transition_format": schema,
+                },
+                target_inputs=dict(_mapping(raw.get("target_inputs"))),
+                target_pointer=(None if raw.get("target_pointer") is None else int(raw["target_pointer"])),
+                candidate_queries=(
+                    tuple(str(item) for item in raw_queries)
+                    if isinstance(raw_queries, Sequence) and not isinstance(raw_queries, (str, bytes))
+                    else ()
+                ),
+                candidate_paths=(
+                    tuple(str(item) for item in raw_paths)
+                    if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes))
+                    else ()
+                ),
+            ))
     return tuple(rows)
 
 
@@ -355,9 +395,17 @@ def prepare_transition_file(episodes: Sequence[str | Path], output: str | Path) 
     return dump_transitions(rows, output)
 
 
+def merge_transition_files(inputs: Sequence[str | Path], output: str | Path) -> int:
+    rows: list[RecurrentTransition] = []
+    for path in inputs:
+        rows.extend(load_transitions(path))
+    return dump_transitions(rows, output)
+
+
 __all__ = [
     "ACTION_VOCAB",
     "LEGACY_RECURRENT_TRANSITION_FORMAT",
+    "LEGACY_RECURRENT_TRANSITION_FORMATS",
     "MAX_RECURRENT_SEQUENCE_ITEMS",
     "MAX_RECURRENT_TEXT_CHARS",
     "RECURRENT_TRANSITION_FORMAT",
@@ -368,6 +416,7 @@ __all__ = [
     "episode_to_transitions",
     "load_episode",
     "load_transitions",
+    "merge_transition_files",
     "normalize_event",
     "prepare_transition_file",
 ]

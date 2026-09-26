@@ -61,7 +61,7 @@ def test_load_tasks_rejects_duplicate_ids(tmp_path: Path) -> None:
         load_tasks(tasks)
 
 
-def test_oracle_collection_replays_known_fix_without_model_teacher(tmp_path: Path) -> None:
+def test_oracle_collection_uses_same_base_retrieval_and_verified_span_fix(tmp_path: Path) -> None:
     repo, base, fix = _make_repo(tmp_path)
     tasks = tmp_path / "tasks.jsonl"
     tasks.write_text(
@@ -99,16 +99,23 @@ def test_oracle_collection_replays_known_fix_without_model_teacher(tmp_path: Pat
     episode = json.loads((output / "known-fix.json").read_text(encoding="utf-8"))
     assert episode["success"] is True
     assert episode["metadata"]["collection_mode"] == "oracle"
+    assert episode["metadata"]["gold_used_for_localization"] is False
+    candidates = episode["metadata"]["retrieval"]["candidates"]
+    assert candidates
+    assert candidates[0]["path"] == "value.py"
     actions = [
         step["action"]["name"] if step.get("action") else "stop"
         for step in episode["steps"]
     ]
     assert actions[0] == "repo.search"
     assert "repo.read" in actions
-    assert "repo.edit" in actions
+    assert "repo.replace" in actions or "repo.edit" in actions
     assert "verify.run" in actions
     assert actions[-1] == "stop"
     assert "VALUE = 'fixed'" in episode["patch"]
+    repair = episode["metadata"]["repair_targets"][0]
+    assert repair["path"] == "value.py"
+    assert repair["action"] == "repo.replace"
 
 
 def test_oracle_collection_recovers_stale_worktree_registration(tmp_path: Path) -> None:

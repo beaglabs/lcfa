@@ -101,12 +101,65 @@ class _Visitor(ast.NodeVisitor):
         self.indexer.graph.add_edge(owner, relation, type_id)
         self.indexer.types.add(type_id)
 
+    def _put_identifier(
+        self,
+        name: str,
+        node: ast.AST,
+        *,
+        relation: str = "references",
+    ) -> str | None:
+        rendered = str(name).strip()
+        if not rendered:
+            return None
+        rel_path = str(self.path.relative_to(self.indexer.root))
+        identifier_id = f"identifier://python/{rendered}"
+        self.indexer.graph.put_node(
+            identifier_id,
+            "identifier",
+            rendered,
+            {"name": rendered},
+            metadata={"language": "python"},
+        )
+        self.indexer.graph.add_edge(
+            self._owner(),
+            relation,
+            identifier_id,
+            metadata={
+                "path": rel_path,
+                "lineno": getattr(node, "lineno", None),
+                "col_offset": getattr(node, "col_offset", None),
+            },
+        )
+        kind = "ast_call" if isinstance(node, ast.Call) else "ast_identifier"
+        ast_id = (
+            f"ast://{self.indexer.repo_key}/{rel_path}#"
+            f"{getattr(node, 'lineno', 0)}:{getattr(node, 'col_offset', 0)}:{kind}:{rendered}"
+        )
+        self.indexer.graph.put_node(
+            ast_id,
+            kind,
+            rendered,
+            {"name": rendered, "ast_type": type(node).__name__},
+            metadata={
+                "language": "python",
+                "path": rel_path,
+                "lineno": getattr(node, "lineno", None),
+                "end_lineno": getattr(node, "end_lineno", None),
+                "col_offset": getattr(node, "col_offset", None),
+            },
+        )
+        self.indexer.graph.add_edge(self._owner(), "contains_ast", ast_id)
+        self.indexer.graph.add_edge(ast_id, "references", identifier_id)
+        self.indexer.graph.add_edge(ast_id, "part_of", self._owner())
+        return identifier_id
+
     def visit_Import(self, node: ast.Import) -> Any:
         for alias in node.names:
             package = alias.name.split(".")[0]
             pkg_id = f"package://python/{package}"
             self.indexer.graph.put_node(pkg_id, "package", package, {"name": package}, metadata={"ecosystem": "python"})
             self.indexer.graph.add_edge(self._owner(), "imports", pkg_id, metadata={"name": alias.name})
+            self._put_identifier(alias.name, node, relation="imports_identifier")
             self.indexer.packages.add(pkg_id)
         self.generic_visit(node)
 
@@ -116,7 +169,10 @@ class _Visitor(ast.NodeVisitor):
             pkg_id = f"package://python/{package}"
             self.indexer.graph.put_node(pkg_id, "package", package, {"name": package}, metadata={"ecosystem": "python"})
             self.indexer.graph.add_edge(self._owner(), "imports", pkg_id, metadata={"name": node.module})
+            self._put_identifier(node.module, node, relation="imports_identifier")
             self.indexer.packages.add(pkg_id)
+        for alias in node.names:
+            self._put_identifier(alias.name, node, relation="imports_identifier")
         self.generic_visit(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -141,6 +197,7 @@ class _Visitor(ast.NodeVisitor):
         )
         self.indexer.graph.add_edge(self._owner(), "defines", symbol_id)
         self.indexer.symbols.add(symbol_id)
+        self._put_identifier(node.name, node, relation="defines_identifier")
         for item in params:
             self._put_type(item["annotation"], symbol_id, "accepts")
         self._put_type(returns, symbol_id, "returns")
@@ -167,6 +224,7 @@ class _Visitor(ast.NodeVisitor):
         )
         self.indexer.graph.add_edge(self._owner(), "defines", symbol_id)
         self.indexer.symbols.add(symbol_id)
+        self._put_identifier(node.name, node, relation="defines_identifier")
         for base in bases:
             base_id = f"type://python/{base}"
             self.indexer.graph.put_node(base_id, "type", base, {"type": base}, metadata={"language": "python"})
@@ -189,6 +247,22 @@ class _Visitor(ast.NodeVisitor):
             target_id = f"callable://python/{name}"
             self.indexer.graph.put_node(target_id, "callable_ref", name, {"name": name}, metadata={"language": "python"})
             self.indexer.graph.add_edge(self._owner(), "calls", target_id, metadata={"lineno": getattr(node, "lineno", None)})
+            self._put_identifier(name, node, relation="calls_identifier")
+        self.generic_visit(node)
+
+    def visit_keyword(self, node: ast.keyword) -> Any:
+        if node.arg:
+            self._put_identifier(node.arg, node, relation="uses_keyword")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> Any:
+        name = _expr_name(node)
+        if name:
+            self._put_identifier(name, node)
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> Any:
+        self._put_identifier(node.id, node)
         self.generic_visit(node)
 
 
