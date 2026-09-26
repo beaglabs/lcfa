@@ -117,13 +117,7 @@ def _lexical_terms(text: str) -> set[str]:
 
 
 def _path_boost(path: str, queries: Sequence[str], goal: str) -> tuple[float, tuple[str, ...]]:
-    """Score filename/path evidence independently of symbol-frequency evidence.
-
-    Repositories often contain many references to an identifier, which can
-    swamp the file that is explicitly named by the issue (for example an issue
-    about the RWKV controller should strongly favor ``rwkv_controller.py``).
-    Path evidence is deterministic and uses only the base repository.
-    """
+    """Score filename/path evidence independently of symbol-frequency evidence."""
     rendered = str(PurePosixPath(path)).casefold()
     stem = PurePosixPath(path).stem.casefold()
     path_terms = _lexical_terms(rendered)
@@ -164,7 +158,7 @@ def build_retrieval_context(
     query_limit: int = MAX_RETRIEVAL_QUERIES,
     candidate_limit: int = MAX_RETRIEVAL_CANDIDATES,
 ) -> RetrievalContext:
-    """Fuse exact identifier lookup, lexical graph search, AST relations and path evidence.
+    """Fuse direct paths, exact identifiers, lexical search and AST relations.
 
     Scores are deterministic and only use the indexed base repository. No
     historical fix path or gold patch information is accepted by this API.
@@ -189,6 +183,21 @@ def build_retrieval_context(
 
     for rank, query in enumerate(queries):
         query_weight = max(1.0, 4.0 - rank * 0.35)
+
+        # Give issue-named files/modules their own retrieval lane before
+        # high-frequency identifier matches can dominate the candidate pool.
+        for node in graph.search(query, kinds=("file", "module"), limit=64):
+            path = _path(node)
+            if not path:
+                continue
+            q = query.casefold()
+            normalized_path = path.casefold().replace("-", "_")
+            normalized_query = q.replace("-", "_")
+            path_score = 8.0 * query_weight
+            if normalized_query in normalized_path:
+                path_score = 18.0 * query_weight
+            add(node, path_score, f"direct-path:{query}")
+
         exact_ids = (
             f"identifier://python/{query}",
             f"callable://python/{query}",
