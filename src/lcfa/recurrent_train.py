@@ -14,30 +14,10 @@ from typing import Any, Mapping
 from .recurrent_eval import evaluate_loaded_heads, group_episodes, split_transitions
 from .recurrent_transitions import ACTION_VOCAB, RecurrentTransition, load_transitions
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError
+from .torch_runtime import resolve_device, resolve_dtype
 
 
 TRAINING_FORMAT = "lcfa.rwkv-controller-training.v1"
-
-
-def _dtype(torch: Any, name: str) -> Any:
-    value = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }.get(str(name).lower())
-    if value is None:
-        raise RWKVControllerError(f"unsupported dtype: {name}")
-    return value
-
-
-def _device(torch: Any, requested: str | None) -> str:
-    if requested:
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def _event_text(row: RecurrentTransition) -> str:
@@ -51,8 +31,8 @@ def train_rwkv_heads(
     model_id: str = DEFAULT_RWKV_MODEL,
     epochs: int = 3,
     learning_rate: float = 1e-3,
-    device: str | None = None,
-    dtype: str = "bfloat16",
+    device: str | None = "auto",
+    dtype: str = "auto",
     validation_fraction: float = 0.2,
     seed: int = 20260925,
 ) -> Mapping[str, Any]:
@@ -81,8 +61,11 @@ def train_rwkv_heads(
 
     random.seed(seed)
     torch.manual_seed(seed)
-    resolved_device = _device(torch, device)
-    resolved_dtype = _dtype(torch, dtype)
+    resolved_device = resolve_device(torch, device)
+    try:
+        resolved_dtype_name, resolved_dtype = resolve_dtype(torch, resolved_device, dtype)
+    except ValueError as exc:
+        raise RWKVControllerError(str(exc)) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -141,10 +124,14 @@ def train_rwkv_heads(
                 stop_logit = heads["stop"](hidden).squeeze(-1)
                 value_logit = heads["value"](hidden).squeeze(-1)
                 target_action = torch.tensor(
-                    [action_index[row.target_action]], device=resolved_device, dtype=torch.long
+                    [action_index[row.target_action]],
+                    device=resolved_device,
+                    dtype=torch.long,
                 )
                 target_stop = torch.tensor(
-                    [float(row.stop_target)], device=resolved_device, dtype=torch.float32
+                    [float(row.stop_target)],
+                    device=resolved_device,
+                    dtype=torch.float32,
                 )
                 loss = torch.nn.functional.cross_entropy(action_logits, target_action)
                 loss = loss + torch.nn.functional.binary_cross_entropy_with_logits(
@@ -152,7 +139,9 @@ def train_rwkv_heads(
                 )
                 if row.value_target is not None:
                     target_value = torch.tensor(
-                        [float(row.value_target)], device=resolved_device, dtype=torch.float32
+                        [float(row.value_target)],
+                        device=resolved_device,
+                        dtype=torch.float32,
                     )
                     loss = loss + torch.nn.functional.binary_cross_entropy_with_logits(
                         value_logit.float(), target_value
@@ -166,14 +155,16 @@ def train_rwkv_heads(
                 last_loss = float(loss.detach().cpu().item())
 
                 predicted_action = int(torch.argmax(action_logits.detach(), dim=-1)[0].item())
-                optimization_action_correct += int(predicted_action == action_index[row.target_action])
+                optimization_action_correct += int(
+                    predicted_action == action_index[row.target_action]
+                )
                 optimization_action_total += 1
-                predicted_stop = bool(torch.sigmoid(stop_logit.detach().float())[0].item() >= 0.5)
+                predicted_stop = bool(
+                    torch.sigmoid(stop_logit.detach().float())[0].item() >= 0.5
+                )
                 optimization_stop_correct += int(predicted_stop == row.stop_target)
                 optimization_stop_total += 1
 
-    # These are the metrics that matter: freeze the trained heads and replay
-    # each episode from a fresh recurrent state after all updates are complete.
     heads.eval()
     train_evaluation = evaluate_loaded_heads(
         train_rows,
@@ -183,20 +174,27 @@ def train_rwkv_heads(
         device=resolved_device,
         action_names=ACTION_VOCAB,
     )
-    validation_evaluation = evaluate_loaded_heads(
-        validation_rows,
-        model=model,
-        tokenizer=tokenizer,
-        heads=heads,
-        device=resolved_device,
-        action_names=ACTION_VOCAB,
-    ) if validation_rows else {"summary": None, "predictions": []}
+    validation_evaluation = (
+        evaluate_loaded_heads(
+            validation_rows,
+            model=model,
+            tokenizer=tokenizer,
+            heads=heads,
+            device=resolved_device,
+            action_names=ACTION_VOCAB,
+        )
+        if validation_rows
+        else {"summary": None, "predictions": []}
+    )
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     weights_path = output / "heads.safetensors"
     save_file(
-        {key: value.detach().cpu().contiguous() for key, value in heads.state_dict().items()},
+        {
+            key: value.detach().cpu().contiguous()
+            for key, value in heads.state_dict().items()
+        },
         str(weights_path),
     )
     evaluation_payload = {
@@ -216,6 +214,8 @@ def train_rwkv_heads(
         "model_id": model_id,
         "hidden_size": hidden_size,
         "action_vocab": list(ACTION_VOCAB),
+        "device": resolved_device,
+        "dtype": resolved_dtype_name,
         "epochs": max(1, int(epochs)),
         "learning_rate": float(learning_rate),
         "transitions": len(rows),
@@ -229,11 +229,13 @@ def train_rwkv_heads(
         "final_loss": last_loss,
         "optimization_action_accuracy": (
             optimization_action_correct / optimization_action_total
-            if optimization_action_total else 0.0
+            if optimization_action_total
+            else 0.0
         ),
         "optimization_stop_accuracy": (
             optimization_stop_correct / optimization_stop_total
-            if optimization_stop_total else 0.0
+            if optimization_stop_total
+            else 0.0
         ),
         "train_action_accuracy": train_summary["action_accuracy"],
         "train_stop_accuracy": train_summary["stop_accuracy"],
@@ -258,7 +260,8 @@ def train_rwkv_heads(
         "seed": seed,
     }
     (output / "controller.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return summary
 
