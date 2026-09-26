@@ -104,11 +104,17 @@ class RWKVSemanticBackbone:
         self._step += 1
         choice = dict(self.policy.choose(goal, solution, recent, self._step))
         controller = choice.get("controller")
-        if isinstance(controller, Mapping) and controller.get("fallback_from") == "repo.read":
+        action = choice.get("action")
+        if isinstance(action, Mapping) and action.get("name") == "repo.read":
+            path = self._candidate_path(cognition)
+            if path:
+                choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
+        elif isinstance(controller, Mapping) and controller.get("fallback_from") == "repo.read":
             path = self._candidate_path(cognition)
             if path:
                 choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
                 choice["controller"] = {**dict(controller), "fallback_resolved": True}
+
         action = choice.get("action")
         self._last_action = dict(action) if isinstance(action, Mapping) else None
         text = json.dumps(choice, sort_keys=True, ensure_ascii=False)
@@ -133,12 +139,15 @@ def load_rwkv_semantic_backbone(
     resolved_model = str(model_id or raw.get("model_id") or "")
     if not resolved_model:
         raise ValueError("controller manifest requires model_id")
+    action_vocab = tuple(raw.get("action_vocab") or ())
+    if not action_vocab:
+        raise ValueError("controller manifest requires action_vocab")
     policy = RWKVRecurrentPolicy(
         resolved_model,
         heads_path=resolved_root / weights,
         device=device,
         dtype=dtype,
-        action_names=tuple(raw.get("action_vocab") or ()),
+        action_names=action_vocab,
     )
     return RWKVSemanticBackbone(policy, graph)
 
