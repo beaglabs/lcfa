@@ -22,6 +22,8 @@ from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVCon
 from .rwkv_semantic import RWKVSemanticBackbone, load_rwkv_semantic_backbone
 from .semantic_agent import SEMANTIC_AGENT_TRAJECTORY_FORMAT, SemanticAgentEpisode, SemanticAgentStep, SemanticWorkspaceAgent
 from .semantic_graph import SEMANTIC_GRAPH_FORMAT, ConceptEdge, ConceptNode, ConceptSnapshot, ContentRef, SemanticGraph, SQLiteSemanticGraph
+from .addressable_memory import MEMORY_SPEC_FORMAT, BASE_OVERLAY, AddressableMemoryError, MemoryNotFoundError, MemoryConflictError, MemoryBackendUnavailable, MemoryObject, MemoryRef, MemoryEdge, MemoryEvent, MemorySnapshot, VectorBinding, MemoryVectorHit, canonical_address, normalize_address, code_address, SQLiteAddressableMemory, FaissMemoryIndex
+from .memory_actions import MemoryActionError, register_memory_actions
 from .serde import IR_FORMAT, SerializationError, dump_ir, dumps_ir, from_ir_dict, load_ir, loads_ir, to_ir_dict
 from .state import MemoryStateStore, StateConflictError, StateIdentity, StateNotFoundError, StateSnapshot, StateStore, StateStoreError, canonical_bytes, content_hash
 from .stochastic import FlowCandidate, FlowToolRequest, StochasticFlowReasoner
