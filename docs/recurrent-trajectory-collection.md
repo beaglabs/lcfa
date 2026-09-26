@@ -79,13 +79,13 @@ Each episode remains `lcfa.semantic-trajectory.v1` and adds:
 - post-agent verifier stdout/stderr/return code;
 - teacher artifact and collection settings.
 
-This means `lcfa-recurrent prepare` can use the episodes directly and the value target comes from a real external verification result rather than the agent declaring itself finished.
+This means `lcfa-recurrent prepare` can use the collection directory directly and will ignore non-episode JSON such as `collection.json`. The value target comes from a real external verification result rather than the agent declaring itself finished.
 
 ## Prepare and train
 
 ```bash
 lcfa-recurrent prepare \
-  data/recurrent/episodes/*.json \
+  data/recurrent/episodes \
   -o data/recurrent/transitions.jsonl
 
 lcfa-recurrent train \
