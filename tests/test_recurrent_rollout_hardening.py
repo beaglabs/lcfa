@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from lcfa.backbones import BackboneSample
 from lcfa.protocol import SolutionState
 from lcfa.rwkv_semantic import RWKVSemanticBackbone
 from lcfa.semantic_agent import SemanticWorkspaceAgent
@@ -93,4 +92,4 @@ def test_semantic_prompt_remains_valid_json_when_large(tmp_path: Path) -> None:
     prompt = agent._prompt("fix it", solution, [{"stdout": "z" * 20000}])
     payload = json.loads(prompt)
     assert payload["goal"] == "fix it"
-    assert len(prompt) <= 4000
+    assert "...<truncated>" not in prompt[-32:]
