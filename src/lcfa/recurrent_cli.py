@@ -153,6 +153,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "prepare":
         count = prepare_transition_file(args.episodes, args.output)
+        if count == 0:
+            Path(args.output).unlink(missing_ok=True)
+            parser.error(
+                "no recurrent transitions were produced; inspect collection.json for task errors "
+                "before training"
+            )
         print(json.dumps({"transitions": count, "output": args.output}, indent=2))
         return 0
 
