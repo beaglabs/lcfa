@@ -1,9 +1,8 @@
 """Transition datasets for training recurrent LCFA controllers.
 
 The event stream contains only information available during rollout: the goal,
-a compact shared retrieval context, and prior action/observation pairs.  Action
-supervision also retains the target inputs and optional candidate-pointer label
-so training covers the noun as well as the verb.
+a compact shared retrieval context, and prior action/observation pairs. Action
+supervision separately retains target inputs and optional candidate pointers.
 """
 from __future__ import annotations
 
@@ -13,7 +12,23 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .repo_retrieval import pointer_for_action, retrieval_from_mapping
+# One bundled historical verifier imports this module directly by file path.
+# Keep that compatibility: retrieval supervision is optional for such legacy
+# episodes and package-relative helpers must not make the module unimportable.
+try:
+    from .repo_retrieval import pointer_for_action, retrieval_from_mapping
+except ImportError:  # pragma: no cover - exercised by detached historical verifier
+    def retrieval_from_mapping(value: Mapping[str, Any] | None) -> None:
+        del value
+        return None
+
+    def pointer_for_action(
+        action: str,
+        inputs: Mapping[str, Any],
+        retrieval: Any,
+    ) -> None:
+        del action, inputs, retrieval
+        return None
 
 
 RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v3"
@@ -189,6 +204,8 @@ def _retrieval_summary(value: Mapping[str, Any] | None) -> Mapping[str, Any] | N
         if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes))
         else []
     )
+    if not queries and not paths:
+        return None
     return {"queries": queries, "paths": paths}
 
 
@@ -249,8 +266,7 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         raise ValueError("semantic episode steps must be an array")
 
     episode_metadata = _mapping(episode.get("metadata"))
-    retrieval_raw = _mapping(episode_metadata.get("retrieval"))
-    retrieval = retrieval_from_mapping(retrieval_raw)
+    retrieval = retrieval_from_mapping(_mapping(episode_metadata.get("retrieval")))
     candidate_queries = retrieval.queries if retrieval is not None else ()
     candidate_paths = retrieval.candidate_paths if retrieval is not None else ()
     value_target = _episode_success(episode)
@@ -267,14 +283,13 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         inputs = dict(_mapping(action.get("inputs"))) if action else {}
 
         if position == 1:
-            event: Mapping[str, Any] = normalize_event({
-                "kind": "goal",
-                "goal": goal,
-                "retrieval": {
+            goal_event: dict[str, Any] = {"kind": "goal", "goal": goal}
+            if candidate_queries or candidate_paths:
+                goal_event["retrieval"] = {
                     "queries": list(candidate_queries),
                     "paths": list(candidate_paths),
-                },
-            })
+                }
+            event: Mapping[str, Any] = normalize_event(goal_event)
         else:
             event = normalize_event({
                 "kind": "transition",
