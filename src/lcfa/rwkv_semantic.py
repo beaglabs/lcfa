@@ -45,8 +45,12 @@ class RWKVSemanticBackbone:
             except KeyError:
                 continue
             path = node.metadata.get("path")
-            if path:
-                return str(path)
+            if not path:
+                continue
+            rendered = str(path).strip()
+            if not rendered or rendered in {".", "/"} or Path(rendered).is_absolute():
+                continue
+            return rendered
         return None
 
     def _ingest_delta(
@@ -78,7 +82,9 @@ class RWKVSemanticBackbone:
         try:
             payload = json.loads(user_prompt)
         except json.JSONDecodeError as exc:
-            raise ValueError("semantic RWKV adapter expects SemanticWorkspaceAgent JSON prompt") from exc
+            raise ValueError(
+                "semantic RWKV adapter received invalid JSON; SemanticWorkspaceAgent must compact fields before serialization"
+            ) from exc
         if not isinstance(payload, Mapping):
             raise ValueError("semantic RWKV prompt must be an object")
         goal = str(payload.get("goal") or "")
@@ -107,11 +113,25 @@ class RWKVSemanticBackbone:
             path = self._candidate_path(cognition)
             if path:
                 choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
+            else:
+                choice["action"] = {"name": "repo.search", "inputs": {"query": goal}}
+                choice["controller"] = {
+                    **(dict(controller) if isinstance(controller, Mapping) else {}),
+                    "fallback_from": "repo.read",
+                    "fallback_reason": "no valid candidate file path",
+                }
         elif isinstance(controller, Mapping) and controller.get("fallback_from") == "repo.read":
             path = self._candidate_path(cognition)
             if path:
                 choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
                 choice["controller"] = {**dict(controller), "fallback_resolved": True}
+            else:
+                choice["action"] = {"name": "repo.search", "inputs": {"query": goal}}
+                choice["controller"] = {
+                    **dict(controller),
+                    "fallback_resolved": False,
+                    "fallback_reason": "no valid candidate file path",
+                }
 
         action = choice.get("action")
         self._last_action = dict(action) if isinstance(action, Mapping) else None

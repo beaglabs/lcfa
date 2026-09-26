@@ -10,9 +10,10 @@ from uuid import uuid4
 from .cognitive import SemanticInvestigator
 from .engine import LCFA
 from .protocol import ActionGraph, ActionNode, ActionRun, ExecutionContext, SolutionState
+from .recurrent_transitions import compact_observation
 from .semantic_graph import SQLiteSemanticGraph
 from .state import content_hash
-from .workspace_actions import compile_cognitive_actions, register_workspace_actions
+from .workspace_actions import WorkspaceActionError, compile_cognitive_actions, register_workspace_actions
 
 SEMANTIC_AGENT_TRAJECTORY_FORMAT = "lcfa.semantic-trajectory.v1"
 
@@ -61,9 +62,6 @@ def _clip(value: str, limit: int) -> str:
 class SemanticWorkspaceAgent:
     """Semantic world model driven by a recurrent-controller compatibility adapter."""
 
-    # The RWKV adapter ignores the natural-language instruction itself and reads
-    # the JSON envelope. Keeping the envelope here preserves the existing agent
-    # state machine without retaining a language-policy entrypoint.
     SYSTEM_PROMPT = '''LCFA recurrent controller compatibility envelope.
 Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, verify.run, git.status, git.diff, process.exec, docs.fetch.'''
 
@@ -112,19 +110,71 @@ Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, veri
         return out
 
     def _prompt(self, goal: str, solution: SolutionState, recent: list[Mapping[str, Any]]) -> str:
-        cognition = solution.values.get("cognition", {})
-        payload = {
+        cognition_raw = solution.values.get("cognition", {})
+        cognition = dict(cognition_raw) if isinstance(cognition_raw, Mapping) else {}
+        concepts = [dict(item) for item in self._concept_context(solution)]
+        compact_recent = [compact_observation(None, item) for item in recent[-4:]]
+        payload: dict[str, Any] = {
             "goal": goal,
             "cognition": cognition,
-            "concepts": self._concept_context(solution),
-            "recent_observations": recent[-4:],
+            "concepts": concepts,
+            "recent_observations": compact_recent,
             "docs_fetch_available": self.allow_docs,
             "verifier_available": bool(self.verify_argv),
         }
-        return _clip(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
-            self.max_context_chars,
-        )
+
+        def render() -> str:
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+        text = render()
+        if len(text) <= self.max_context_chars:
+            return text
+
+        for concept in concepts:
+            if isinstance(concept.get("content"), str):
+                concept["content"] = _clip(str(concept["content"]), 512)
+        payload["recent_observations"] = compact_recent[-2:]
+        text = render()
+        if len(text) <= self.max_context_chars:
+            return text
+
+        payload["concepts"] = [
+            {
+                "id": item.get("id"),
+                "kind": item.get("kind"),
+                "label": item.get("label"),
+                "metadata": item.get("metadata"),
+                "content_hash": item.get("content_hash"),
+            }
+            for item in concepts[:6]
+        ]
+        payload["cognition"] = {
+            "active_concepts": list(cognition.get("active_concepts", ()))[:12],
+            "candidate_locations": list(cognition.get("candidate_locations", ()))[:8],
+            "open_questions": list(cognition.get("open_questions", ()))[:4],
+            "terminal": bool(cognition.get("terminal", False)),
+        }
+        text = render()
+        if len(text) <= self.max_context_chars:
+            return text
+
+        payload["concepts"] = []
+        payload["recent_observations"] = compact_recent[-1:]
+        text = render()
+        if len(text) <= self.max_context_chars:
+            return text
+
+        # Last-resort envelope remains valid JSON rather than truncating the
+        # serialized document mid-string/mid-object.
+        payload = {
+            "goal": _clip(goal, max(256, self.max_context_chars // 2)),
+            "cognition": payload["cognition"],
+            "concepts": [],
+            "recent_observations": [],
+            "docs_fetch_available": self.allow_docs,
+            "verifier_available": bool(self.verify_argv),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
     def _choose(
         self,
@@ -234,12 +284,21 @@ Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, veri
             "results": {key: value.value for key, value in run.results.items()},
             "observations": dict(run.observations),
         }
+        return self._store_observation(episode_id, step, solution, observation)
+
+    def _store_observation(
+        self,
+        episode_id: str,
+        step: int,
+        solution: SolutionState,
+        observation: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
         node_id = f"observation://{episode_id}/{step}"
         node = self.graph.put_node(
             node_id,
             "observation",
             f"agent step {step}",
-            observation,
+            dict(observation),
             metadata={
                 "episode_id": episode_id,
                 "step": step,
@@ -250,7 +309,7 @@ Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, veri
         if isinstance(cognition, Mapping):
             for concept_id in list(cognition.get("active_concepts", ()))[:8]:
                 self.graph.add_edge(node.id, "observed_for", str(concept_id))
-        return {"concept_id": node.id, "content_hash": node.content.content_hash, **observation}
+        return {"concept_id": node.id, "content_hash": node.content.content_hash, **dict(observation)}
 
     def _context(self, *, auto_approve: bool, action_graph: ActionGraph) -> ExecutionContext:
         approvals = frozenset(
@@ -282,6 +341,26 @@ Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, veri
             approvals=approvals,
             metadata=metadata,
         )
+
+    def _advance_cognition(
+        self,
+        solution: SolutionState,
+        observation: Mapping[str, Any],
+    ) -> SolutionState:
+        cognition = dict(solution.values.get("cognition", {}))
+        obs = list(cognition.get("observations", ()))
+        obs.append({
+            "concept_id": observation["concept_id"],
+            "content_hash": observation["content_hash"],
+        })
+        cognition["observations"] = obs
+        cognition["active_concepts"] = list(
+            dict.fromkeys([
+                *cognition.get("active_concepts", ()),
+                observation["concept_id"],
+            ])
+        )
+        return replace(solution, values={**solution.values, "cognition": cognition})
 
     def run(self, goal: str, *, auto_approve: bool = False) -> SemanticAgentEpisode:
         episode_id = f"semantic-episode:{uuid4()}"
@@ -328,27 +407,28 @@ Allowed actions: repo.read, repo.search, repo.replace, repo.edit, test.run, veri
                 if terminal:
                     break
                 continue
-            run = self.executor.execute(
-                graph,
-                solution,
-                self._context(auto_approve=auto_approve, action_graph=graph),
-            )
-            observation = self._ingest_observation(episode_id, index, solution, run)
+            try:
+                run = self.executor.execute(
+                    graph,
+                    solution,
+                    self._context(auto_approve=auto_approve, action_graph=graph),
+                )
+                observation = self._ingest_observation(episode_id, index, solution, run)
+            except (WorkspaceActionError, FileNotFoundError, ValueError) as exc:
+                observation = self._store_observation(
+                    episode_id,
+                    index,
+                    solution,
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "action_failed": dict(action_raw) if isinstance(action_raw, Mapping) else None,
+                    },
+                )
             recent.append(observation)
-            cognition = dict(solution.values.get("cognition", {}))
-            obs = list(cognition.get("observations", ()))
-            obs.append({
-                "concept_id": observation["concept_id"],
-                "content_hash": observation["content_hash"],
-            })
-            cognition["observations"] = obs
-            cognition["active_concepts"] = list(
-                dict.fromkeys([
-                    *cognition.get("active_concepts", ()),
-                    observation["concept_id"],
-                ])
-            )
-            solution = replace(solution, values={**solution.values, "cognition": cognition})
+            solution = self._advance_cognition(solution, observation)
             steps.append(
                 SemanticAgentStep(
                     index=index,
