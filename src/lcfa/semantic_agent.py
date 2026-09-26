@@ -8,9 +8,9 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from .artifact import load_artifact_reasoner
-from .cognitive import CognitiveState, Hypothesis, SemanticInvestigator
+from .cognitive import SemanticInvestigator
 from .engine import LCFA
-from .protocol import ActionRun, ExecutionContext, SolutionState
+from .protocol import ActionGraph, ActionNode, ActionRun, ExecutionContext, SolutionState
 from .semantic_graph import SQLiteSemanticGraph
 from .state import content_hash
 from .workspace_actions import compile_cognitive_actions, register_workspace_actions
@@ -80,12 +80,14 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
         *,
         max_steps: int = 12,
         max_context_chars: int = 16000,
+        allow_docs: bool = False,
     ) -> None:
         self.graph = graph
         self.workspace_root = Path(workspace_root).resolve()
         self.backbone = backbone
         self.max_steps = max(1, int(max_steps))
         self.max_context_chars = max(4000, int(max_context_chars))
+        self.allow_docs = bool(allow_docs)
         actions = register_workspace_actions()
         self.executor = LCFA(actions=actions).agentic
 
@@ -98,13 +100,17 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
         *,
         max_steps: int = 12,
         max_context_chars: int = 16000,
+        allow_docs: bool = False,
         runtime_options: Mapping[str, Any] | None = None,
     ) -> "SemanticWorkspaceAgent":
         reasoner = load_artifact_reasoner(artifact, base_engine=LCFA(), runtime_options=dict(runtime_options or {}))
         backbone = getattr(reasoner, "backbone", None)
         if backbone is None:
             raise TypeError("semantic agent requires an artifact exposing a stochastic backbone")
-        return cls(graph, workspace_root, backbone, max_steps=max_steps, max_context_chars=max_context_chars)
+        return cls(
+            graph, workspace_root, backbone,
+            max_steps=max_steps, max_context_chars=max_context_chars, allow_docs=allow_docs,
+        )
 
     def _concept_context(self, solution: SolutionState) -> list[Mapping[str, Any]]:
         cognition = solution.values.get("cognition", {})
@@ -131,6 +137,7 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
             "cognition": cognition,
             "concepts": self._concept_context(solution),
             "recent_observations": recent[-4:],
+            "docs_fetch_available": self.allow_docs,
         }
         return _clip(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), self.max_context_chars)
 
@@ -149,6 +156,8 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
         parsed = _extract_json(samples[0].text)
         if parsed is None:
             return {"hypothesis": None, "action": {"name": "repo.search", "inputs": {"query": goal}}, "final": False}
+        if not self.allow_docs and isinstance(parsed.get("action"), Mapping) and parsed["action"].get("name") == "docs.fetch":
+            return {"hypothesis": parsed.get("hypothesis"), "action": {"name": "repo.search", "inputs": {"query": goal}}, "final": False}
         return parsed
 
     def _apply_choice(self, solution: SolutionState, choice: Mapping[str, Any]) -> SolutionState:
@@ -202,13 +211,16 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
                 self.graph.add_edge(node.id, "observed_for", str(concept_id))
         return {"concept_id": node.id, "content_hash": node.content.content_hash, **observation}
 
-    def _context(self, *, auto_approve: bool, action_graph) -> ExecutionContext:
+    def _context(self, *, auto_approve: bool, action_graph: ActionGraph) -> ExecutionContext:
         approvals = frozenset(
             node.approval_key for node in action_graph.nodes
             if auto_approve and node.requires_approval and node.approval_key
         )
+        capabilities = {"workspace.read", "workspace.write", "process.exec"}
+        if self.allow_docs:
+            capabilities.add("network.docs")
         return ExecutionContext(
-            capabilities=frozenset({"workspace.read", "workspace.write", "process.exec", "network.docs"}),
+            capabilities=frozenset(capabilities),
             approvals=approvals,
             metadata={
                 "workspace_root": str(self.workspace_root),
@@ -267,8 +279,5 @@ confidence MUST be a JSON number from 0.0 to 1.0.'''
         patch = str(patch_value.get("stdout", "")) if isinstance(patch_value, Mapping) else ""
         return SemanticAgentEpisode(episode_id, goal, tuple(steps), solution.id, patch)
 
-
-# Imports kept at the bottom to avoid obscuring the cognitive types above.
-from .protocol import ActionGraph, ActionNode  # noqa: E402
 
 __all__ = ["SEMANTIC_AGENT_TRAJECTORY_FORMAT", "SemanticAgentStep", "SemanticAgentEpisode", "SemanticWorkspaceAgent"]
