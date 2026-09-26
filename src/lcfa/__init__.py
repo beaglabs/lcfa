@@ -15,6 +15,7 @@ from .protocol import ActionGraph, ActionNode, ActionResult, ActionRun, EntityRe
 from .registry import ActionRegistry, ActionSpec, OperatorRegistry, OperatorSpec
 from .repo_index import IndexResult, PythonRepoIndexer
 from .runtime import ActionExecutor, ActionPolicyError, PlanError, ReasoningExecutor
+from .semantic_agent import SEMANTIC_AGENT_TRAJECTORY_FORMAT, SemanticAgentEpisode, SemanticAgentStep, SemanticWorkspaceAgent
 from .semantic_graph import SEMANTIC_GRAPH_FORMAT, ConceptEdge, ConceptNode, ConceptSnapshot, ContentRef, SemanticGraph, SQLiteSemanticGraph
 from .serde import IR_FORMAT, SerializationError, dump_ir, dumps_ir, from_ir_dict, load_ir, loads_ir, to_ir_dict
 from .state import MemoryStateStore, StateConflictError, StateIdentity, StateNotFoundError, StateSnapshot, StateStore, StateStoreError, canonical_bytes, content_hash
