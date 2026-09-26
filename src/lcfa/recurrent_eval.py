@@ -15,12 +15,15 @@ from typing import Any, Mapping, Sequence
 
 from .recurrent_transitions import ACTION_VOCAB, RecurrentTransition, load_transitions
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKVControllerError
+from .torch_runtime import resolve_device, resolve_dtype
 
 
 EVALUATION_FORMAT = "lcfa.rwkv-controller-eval.v1"
 
 
-def group_episodes(rows: Sequence[RecurrentTransition]) -> tuple[tuple[RecurrentTransition, ...], ...]:
+def group_episodes(
+    rows: Sequence[RecurrentTransition],
+) -> tuple[tuple[RecurrentTransition, ...], ...]:
     grouped: dict[str, list[RecurrentTransition]] = defaultdict(list)
     for row in rows:
         grouped[row.episode_id].append(row)
@@ -82,15 +85,22 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
         per_action[target]["total"] += 1
         per_action[target]["correct"] += int(bool(item.get("action_correct")))
         if item.get("value_target") is not None and item.get("predicted_value") is not None:
-            value_errors.append(abs(float(item["predicted_value"]) - float(item["value_target"])))
+            value_errors.append(
+                abs(float(item["predicted_value"]) - float(item["value_target"]))
+            )
     exact = sum(
-        all(bool(item.get("action_correct")) and bool(item.get("stop_correct")) for item in episode)
+        all(
+            bool(item.get("action_correct")) and bool(item.get("stop_correct"))
+            for item in episode
+        )
         for episode in by_episode.values()
     )
     rendered_per_action = {
         name: {
             **counts,
-            "accuracy": (counts["correct"] / counts["total"] if counts["total"] else None),
+            "accuracy": (
+                counts["correct"] / counts["total"] if counts["total"] else None
+            ),
         }
         for name, counts in per_action.items()
         if counts["total"]
@@ -106,27 +116,6 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
         "value_mae": sum(value_errors) / len(value_errors) if value_errors else None,
         "per_action": rendered_per_action,
     }
-
-
-def _resolved_dtype(torch: Any, name: str) -> Any:
-    value = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }.get(str(name).lower())
-    if value is None:
-        raise RWKVControllerError(f"unsupported dtype: {name}")
-    return value
-
-
-def _resolved_device(torch: Any, requested: str | None) -> str:
-    if requested:
-        return str(requested)
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def _event_text(row: RecurrentTransition) -> str:
@@ -167,12 +156,18 @@ def evaluate_loaded_heads(
             hidden_states = getattr(outputs, "hidden_states", None)
             state = getattr(outputs, "state", None)
             if not hidden_states or state is None:
-                raise RWKVControllerError("RWKV forward must return hidden_states and recurrent state")
+                raise RWKVControllerError(
+                    "RWKV forward must return hidden_states and recurrent state"
+                )
             hidden = hidden_states[-1][:, -1, :].detach().float()
             with torch.inference_mode():
                 action_logits = heads["action"](hidden)
-                stop_probability = float(torch.sigmoid(heads["stop"](hidden).float())[0, 0].item())
-                predicted_value = float(torch.sigmoid(heads["value"](hidden).float())[0, 0].item())
+                stop_probability = float(
+                    torch.sigmoid(heads["stop"](hidden).float())[0, 0].item()
+                )
+                predicted_value = float(
+                    torch.sigmoid(heads["value"](hidden).float())[0, 0].item()
+                )
             predicted_index = int(torch.argmax(action_logits, dim=-1)[0].item())
             predicted_action = action_names[predicted_index]
             predicted_stop = stop_probability >= 0.5
@@ -200,15 +195,17 @@ def evaluate_rwkv_heads(
     controller_dir: str | Path,
     *,
     model_id: str | None = None,
-    device: str | None = None,
-    dtype: str = "bfloat16",
+    device: str | None = "auto",
+    dtype: str = "auto",
 ) -> Mapping[str, Any]:
     try:
         import torch
         from safetensors.torch import load_file
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
-        raise RWKVControllerError("RWKV evaluation requires `pip install -e '.[rwkv]'`") from exc
+        raise RWKVControllerError(
+            "RWKV evaluation requires `pip install -e '.[rwkv]'`"
+        ) from exc
 
     root = Path(controller_dir)
     manifest_path = root / "controller.json" if root.is_dir() else root
@@ -217,8 +214,13 @@ def evaluate_rwkv_heads(
         raise ValueError("controller manifest must be a JSON object")
     root = manifest_path.parent
     resolved_model = str(model_id or manifest.get("model_id") or DEFAULT_RWKV_MODEL)
-    resolved_device = _resolved_device(torch, device)
-    resolved_dtype = _resolved_dtype(torch, dtype)
+    resolved_device = resolve_device(torch, device)
+    try:
+        resolved_dtype_name, resolved_dtype = resolve_dtype(
+            torch, resolved_device, dtype
+        )
+    except ValueError as exc:
+        raise RWKVControllerError(str(exc)) from exc
     action_names = tuple(manifest.get("action_vocab") or ACTION_VOCAB)
 
     tokenizer = AutoTokenizer.from_pretrained(resolved_model, trust_remote_code=True)
@@ -254,6 +256,7 @@ def evaluate_rwkv_heads(
         "model_id": resolved_model,
         "controller": str(manifest_path),
         "device": resolved_device,
+        "dtype": resolved_dtype_name,
         **result,
     }
 
