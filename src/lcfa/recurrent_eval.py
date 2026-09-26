@@ -148,7 +148,6 @@ def evaluate_loaded_heads(
     except ImportError as exc:
         raise RWKVControllerError("RWKV evaluation requires torch") from exc
     action_names = tuple(str(name) for name in action_names)
-    action_index = {name: index for index, name in enumerate(action_names)}
     heads.eval()
     predictions: list[Mapping[str, Any]] = []
     for episode in group_episodes(rows):
@@ -232,13 +231,16 @@ def evaluate_rwkv_heads(
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
+    if hidden_size <= 0:
+        raise RWKVControllerError("RWKV model config does not expose hidden_size")
     heads = torch.nn.ModuleDict({
         "action": torch.nn.Linear(hidden_size, len(action_names)),
         "stop": torch.nn.Linear(hidden_size, 1),
         "value": torch.nn.Linear(hidden_size, 1),
     }).to(resolved_device)
     weights_path = root / str(manifest.get("weights") or "heads.safetensors")
-    heads.load_state_dict(load_file(str(weights_path), device=resolved_device), strict=True)
+    state = load_file(str(weights_path), device="cpu")
+    heads.load_state_dict(state, strict=True)
     result = evaluate_loaded_heads(
         load_transitions(transitions_path),
         model=model,
