@@ -1,8 +1,8 @@
 """Transition datasets for training recurrent LCFA controllers.
 
-The semantic agent records ``lcfa.semantic-trajectory.v1`` episodes.  This
+The semantic agent records ``lcfa.semantic-trajectory.v1`` episodes. This
 module turns those episodes into one-step supervision records suitable for a
-recurrent controller: previous event/state -> next action + stop/value targets.
+recurrent controller: event_t -> action_t / stop_t / value_t.
 """
 from __future__ import annotations
 
@@ -51,10 +51,8 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 def _episode_success(episode: Mapping[str, Any]) -> float | None:
     """Read an optional externally supplied benchmark outcome.
 
-    Semantic episodes intentionally do not infer success from ``final`` or from
-    producing a non-empty patch.  A value target is valid only when a grader or
-    caller explicitly attaches one as ``success``, ``resolved``, or
-    ``metadata.success``.
+    We never infer success from ``final`` or from producing a patch. A value
+    target is valid only when a grader/caller explicitly attaches one.
     """
     for key in ("success", "resolved"):
         if key in episode:
@@ -84,25 +82,31 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         raise ValueError("semantic episode steps must be an array")
 
     value_target = _episode_success(episode)
-    previous: Mapping[str, Any] = {
-        "kind": "goal",
-        "goal": goal,
-    }
+    previous_action: Mapping[str, Any] | None = None
+    previous_observation: Mapping[str, Any] = {}
     out: list[RecurrentTransition] = []
     for position, raw in enumerate(steps_raw, start=1):
         step = _mapping(raw)
         action = _mapping(step.get("action"))
         action_name = str(action.get("name") or "stop")
         if action_name not in ACTION_VOCAB:
-            # Preserve a closed action vocabulary so a controller head has a
-            # stable output dimension. Unknown actions are not silently folded.
             raise ValueError(f"unsupported recurrent target action: {action_name}")
         terminal = bool(step.get("terminal", False))
-        event = {
-            "previous": previous,
-            "solution_id": step.get("solution_id"),
-            "hypothesis": step.get("hypothesis"),
-        }
+
+        if position == 1:
+            event: Mapping[str, Any] = {
+                "kind": "goal",
+                "goal": goal,
+                "hypothesis": step.get("hypothesis"),
+            }
+        else:
+            event = {
+                "kind": "transition",
+                "action": dict(previous_action) if previous_action else None,
+                "observation": dict(previous_observation),
+                "hypothesis": step.get("hypothesis"),
+            }
+
         out.append(
             RecurrentTransition(
                 episode_id=episode_id,
@@ -115,13 +119,8 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
                 metadata={"has_observation": bool(step.get("observation"))},
             )
         )
-        previous = {
-            "kind": "transition",
-            "action": dict(action) if action else None,
-            "hypothesis": step.get("hypothesis"),
-            "observation": step.get("observation") or {},
-            "terminal": terminal,
-        }
+        previous_action = dict(action) if action else None
+        previous_observation = dict(_mapping(step.get("observation")))
     return tuple(out)
 
 
