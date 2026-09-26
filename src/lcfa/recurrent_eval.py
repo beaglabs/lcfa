@@ -1,10 +1,4 @@
-"""Post-training evaluation for LCFA recurrent RWKV controllers.
-
-Evaluation replays each episode from a fresh RWKV recurrent state unless the
-caller already owns a cache of frozen-backbone hidden states. Splits are
-episode-level so transitions from one trajectory can never leak across train
-and validation.
-"""
+"""Post-training evaluation for LCFA recurrent RWKV controllers."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -18,7 +12,7 @@ from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKVControllerError
 from .torch_runtime import resolve_device, resolve_dtype
 
 
-EVALUATION_FORMAT = "lcfa.rwkv-controller-eval.v1"
+EVALUATION_FORMAT = "lcfa.rwkv-controller-eval.v2"
 
 
 def group_episodes(
@@ -39,7 +33,6 @@ def split_transitions(
     validation_fraction: float = 0.2,
     seed: int = 20260925,
 ) -> tuple[tuple[RecurrentTransition, ...], tuple[RecurrentTransition, ...]]:
-    """Deterministically split complete episodes into train/validation rows."""
     if not 0.0 <= float(validation_fraction) < 1.0:
         raise ValueError("validation_fraction must be in [0, 1)")
     episodes = list(group_episodes(rows))
@@ -63,6 +56,8 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
             "transitions": 0,
             "episodes": 0,
             "action_accuracy": None,
+            "pointer_accuracy": None,
+            "pointer_examples": 0,
             "stop_accuracy": None,
             "exact_episode_accuracy": None,
             "value_examples": 0,
@@ -71,6 +66,8 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
         }
     action_correct = sum(bool(item.get("action_correct")) for item in predictions)
     stop_correct = sum(bool(item.get("stop_correct")) for item in predictions)
+    pointer_items = [item for item in predictions if item.get("target_pointer") is not None]
+    pointer_correct = sum(bool(item.get("pointer_correct")) for item in pointer_items)
     by_episode: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     per_action: dict[str, dict[str, int]] = {
         name: {"total": 0, "correct": 0} for name in ACTION_VOCAB
@@ -90,7 +87,12 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
             )
     exact = sum(
         all(
-            bool(item.get("action_correct")) and bool(item.get("stop_correct"))
+            bool(item.get("action_correct"))
+            and bool(item.get("stop_correct"))
+            and (
+                item.get("target_pointer") is None
+                or bool(item.get("pointer_correct"))
+            )
             for item in episode
         )
         for episode in by_episode.values()
@@ -98,9 +100,7 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
     rendered_per_action = {
         name: {
             **counts,
-            "accuracy": (
-                counts["correct"] / counts["total"] if counts["total"] else None
-            ),
+            "accuracy": (counts["correct"] / counts["total"] if counts["total"] else None),
         }
         for name, counts in per_action.items()
         if counts["total"]
@@ -110,6 +110,10 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
         "transitions": len(predictions),
         "episodes": len(by_episode),
         "action_accuracy": action_correct / len(predictions),
+        "pointer_accuracy": (
+            pointer_correct / len(pointer_items) if pointer_items else None
+        ),
+        "pointer_examples": len(pointer_items),
         "stop_accuracy": stop_correct / len(predictions),
         "exact_episode_accuracy": exact / len(by_episode) if by_episode else None,
         "value_examples": len(value_errors),
@@ -137,6 +141,13 @@ def _prediction_from_hidden(
         predicted_value = float(
             torch.sigmoid(heads["value"](hidden).float())[0, 0].item()
         )
+        predicted_pointer: int | None = None
+        pointer_confidence: float | None = None
+        if "pointer" in heads:
+            pointer_logits = heads["pointer"](hidden)
+            pointer_probs = torch.softmax(pointer_logits, dim=-1)[0]
+            predicted_pointer = int(torch.argmax(pointer_probs).item())
+            pointer_confidence = float(pointer_probs[predicted_pointer].item())
     predicted_index = int(torch.argmax(action_logits, dim=-1)[0].item())
     predicted_action = tuple(action_names)[predicted_index]
     predicted_stop = stop_probability >= 0.5
@@ -146,6 +157,14 @@ def _prediction_from_hidden(
         "target_action": row.target_action,
         "predicted_action": predicted_action,
         "action_correct": predicted_action == row.target_action,
+        "target_pointer": row.target_pointer,
+        "predicted_pointer": predicted_pointer,
+        "pointer_confidence": pointer_confidence,
+        "pointer_correct": (
+            None
+            if row.target_pointer is None
+            else predicted_pointer == row.target_pointer
+        ),
         "target_stop": row.stop_target,
         "predicted_stop": predicted_stop,
         "stop_probability": stop_probability,
@@ -161,22 +180,13 @@ def evaluate_cached_heads(
     heads: Any,
     action_names: Sequence[str] = ACTION_VOCAB,
 ) -> Mapping[str, Any]:
-    """Evaluate fixed heads on already-computed frozen RWKV hidden states."""
     heads.eval()
     predictions = [
-        _prediction_from_hidden(
-            row,
-            hidden,
-            heads=heads,
-            action_names=action_names,
-        )
+        _prediction_from_hidden(row, hidden, heads=heads, action_names=action_names)
         for episode in cached_episodes
         for row, hidden in episode
     ]
-    return {
-        "summary": summarize_predictions(predictions),
-        "predictions": predictions,
-    }
+    return {"summary": summarize_predictions(predictions), "predictions": predictions}
 
 
 def _event_text(row: RecurrentTransition) -> str:
@@ -192,12 +202,12 @@ def evaluate_loaded_heads(
     device: str,
     action_names: Sequence[str] = ACTION_VOCAB,
 ) -> Mapping[str, Any]:
-    """Replay rows through a frozen model/head pair from fresh episode states."""
     try:
         import torch
     except ImportError as exc:
         raise RWKVControllerError("RWKV evaluation requires torch") from exc
     action_names = tuple(str(name) for name in action_names)
+    model.eval()
     heads.eval()
     predictions: list[Mapping[str, Any]] = []
     for episode in group_episodes(rows):
@@ -229,10 +239,7 @@ def evaluate_loaded_heads(
                     action_names=action_names,
                 )
             )
-    return {
-        "summary": summarize_predictions(predictions),
-        "predictions": predictions,
-    }
+    return {"summary": summarize_predictions(predictions), "predictions": predictions}
 
 
 def evaluate_rwkv_heads(
@@ -261,12 +268,11 @@ def evaluate_rwkv_heads(
     resolved_model = str(model_id or manifest.get("model_id") or DEFAULT_RWKV_MODEL)
     resolved_device = resolve_device(torch, device)
     try:
-        resolved_dtype_name, resolved_dtype = resolve_dtype(
-            torch, resolved_device, dtype
-        )
+        resolved_dtype_name, resolved_dtype = resolve_dtype(torch, resolved_device, dtype)
     except ValueError as exc:
         raise RWKVControllerError(str(exc)) from exc
     action_names = tuple(manifest.get("action_vocab") or ACTION_VOCAB)
+    pointer_slots = int(manifest.get("pointer_slots", 0) or 0)
 
     tokenizer = AutoTokenizer.from_pretrained(resolved_model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -274,17 +280,29 @@ def evaluate_rwkv_heads(
         dtype=resolved_dtype,
         trust_remote_code=True,
     ).to(resolved_device)
+    backbone_weights = manifest.get("backbone_weights")
+    if backbone_weights:
+        backbone_state = load_file(str(root / str(backbone_weights)), device=resolved_device)
+        missing, unexpected = model.load_state_dict(backbone_state, strict=False)
+        if missing or unexpected:
+            raise RWKVControllerError(
+                "backbone tensor mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
     if hidden_size <= 0:
         raise RWKVControllerError("RWKV model config does not expose hidden_size")
-    heads = torch.nn.ModuleDict({
+    modules: dict[str, Any] = {
         "action": torch.nn.Linear(hidden_size, len(action_names)),
         "stop": torch.nn.Linear(hidden_size, 1),
         "value": torch.nn.Linear(hidden_size, 1),
-    }).to(resolved_device)
+    }
+    if pointer_slots > 0:
+        modules["pointer"] = torch.nn.Linear(hidden_size, pointer_slots)
+    heads = torch.nn.ModuleDict(modules).to(resolved_device)
     weights_path = root / str(manifest.get("weights") or "heads.safetensors")
     state = load_file(str(weights_path), device="cpu")
     heads.load_state_dict(state, strict=True)
@@ -302,6 +320,7 @@ def evaluate_rwkv_heads(
         "controller": str(manifest_path),
         "device": resolved_device,
         "dtype": resolved_dtype_name,
+        "pointer_slots": pointer_slots,
         **result,
     }
 
