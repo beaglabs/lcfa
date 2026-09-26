@@ -12,6 +12,7 @@ from .operator_lib import ConstraintViolation, register_reasoning_operators
 from .operators import register_core_operators
 from .profile import Profile, ProfileError, load_profile
 from .protocol import ActionGraph, ActionNode, ActionResult, ActionRun, EntityRef, EvidenceRef, EvidenceValue, ExecutionContext, Finding, OperatorResult, PlanNode, ReasoningPlan, Recommendation, SolutionState
+from .recurrent_eval import EVALUATION_FORMAT, evaluate_loaded_heads, evaluate_rwkv_heads, group_episodes, split_transitions, summarize_predictions
 from .recurrent_transitions import ACTION_VOCAB, RECURRENT_TRANSITION_FORMAT, RecurrentTransition, dump_transitions, episode_to_transitions, load_episode, load_transitions, prepare_transition_file
 from .registry import ActionRegistry, ActionSpec, OperatorRegistry, OperatorSpec
 from .repo_index import IndexResult, PythonRepoIndexer
