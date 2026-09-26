@@ -29,6 +29,11 @@ transformers = [
   "torch>=2.6",
   "accelerate>=1.14",
 ]
+rwkv = [
+  "transformers>=5.17,<6",
+  "torch>=2.6",
+  "accelerate>=1.14",
+]
 mlx = [
   "mlx>=0.32.2",
   "mlx-lm>=0.31.3",
@@ -52,6 +57,7 @@ lcfa-bench-suite = "lcfa.bench_suite_cli:main"
 lcfa-bench-card = "lcfa.bench_card:main"
 lcfa-latent = "lcfa.latent_cli:main"
 lcfa-semantic = "lcfa.semantic_cli:main"
+lcfa-recurrent = "lcfa.recurrent_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

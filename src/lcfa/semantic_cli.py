@@ -64,7 +64,12 @@ def _parser() -> argparse.ArgumentParser:
     agent.add_argument("goal")
     agent.add_argument("--root", default=".")
     agent.add_argument("--db")
-    agent.add_argument("--artifact", required=True)
+    controller = agent.add_mutually_exclusive_group(required=True)
+    controller.add_argument("--artifact", help="stochastic language-policy artifact")
+    controller.add_argument("--rwkv-controller", help="directory containing trained controller.json + heads.safetensors")
+    agent.add_argument("--rwkv-model", help="override controller manifest RWKV model id")
+    agent.add_argument("--rwkv-device", help="RWKV device override, e.g. mps/cuda/cpu")
+    agent.add_argument("--rwkv-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     agent.add_argument("--max-steps", type=int, default=12)
     agent.add_argument("--allow-docs", action="store_true", help="enable allowlisted live documentation retrieval")
     agent.add_argument("--auto-approve", action="store_true", help="approve workspace edits/process actions; use only inside an isolated benchmark/worktree")
@@ -101,9 +106,32 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "agent":
             PythonRepoIndexer(graph, root).index()
-            episode = SemanticWorkspaceAgent.from_artifact(
-                graph, root, args.artifact, max_steps=args.max_steps, allow_docs=args.allow_docs
-            ).run(args.goal, auto_approve=args.auto_approve)
+            if args.rwkv_controller:
+                from .rwkv_semantic import load_rwkv_semantic_backbone
+
+                backbone = load_rwkv_semantic_backbone(
+                    args.rwkv_controller,
+                    graph,
+                    model_id=args.rwkv_model,
+                    device=args.rwkv_device,
+                    dtype=args.rwkv_dtype,
+                )
+                agent_runtime = SemanticWorkspaceAgent(
+                    graph,
+                    root,
+                    backbone,
+                    max_steps=args.max_steps,
+                    allow_docs=args.allow_docs,
+                )
+            else:
+                agent_runtime = SemanticWorkspaceAgent.from_artifact(
+                    graph,
+                    root,
+                    args.artifact,
+                    max_steps=args.max_steps,
+                    allow_docs=args.allow_docs,
+                )
+            episode = agent_runtime.run(args.goal, auto_approve=args.auto_approve)
             text = json.dumps(_safe(episode), indent=2, sort_keys=True, ensure_ascii=False)
             if args.output:
                 Path(args.output).write_text(text + "\n", encoding="utf-8")
