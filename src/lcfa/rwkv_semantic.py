@@ -1,7 +1,9 @@
 """Adapter from the recurrent RWKV controller to SemanticWorkspaceAgent.
 
-The semantic agent keeps a structured compatibility envelope, while every
-actual action decision is made by RWKV recurrent state plus trained heads.
+The semantic agent keeps a structured compatibility envelope while every
+action-type decision comes from RWKV recurrent state. Retrieval-backed search,
+read, and edit paths are resolved against the same ranked candidates present in
+the training event stream.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from .backbones import BackboneSample
 from .protocol import SolutionState
+from .repo_retrieval import build_retrieval_context
 from .rwkv_controller import RWKVRecurrentPolicy, load_rwkv_policy
 from .semantic_graph import SQLiteSemanticGraph
 
@@ -27,6 +30,7 @@ class RWKVSemanticBackbone:
         self._last_action: Mapping[str, Any] | None = None
         self._last_observation_id: str | None = None
         self._step = 0
+        self._read_paths: set[str] = set()
 
     def _solution(self, cognition: Mapping[str, Any]) -> SolutionState:
         return SolutionState(
@@ -35,7 +39,39 @@ class RWKVSemanticBackbone:
             values={"cognition": dict(cognition)},
         )
 
-    def _candidate_path(self, cognition: Mapping[str, Any]) -> str | None:
+    @staticmethod
+    def _sequence(cognition: Mapping[str, Any], key: str) -> tuple[str, ...]:
+        raw = cognition.get(key, ())
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            return ()
+        return tuple(str(item) for item in raw if str(item))
+
+    def _ensure_retrieval(self, goal: str, cognition: Mapping[str, Any]) -> Mapping[str, Any]:
+        updated = dict(cognition)
+        if self._sequence(updated, "candidate_queries") and self._sequence(updated, "candidate_paths"):
+            return updated
+        retrieval = build_retrieval_context(self.graph, goal)
+        updated["candidate_queries"] = list(retrieval.queries)
+        updated["candidate_paths"] = list(retrieval.candidate_paths)
+        updated["candidate_locations"] = list(retrieval.candidate_ids)
+        return updated
+
+    def _candidate_path(
+        self,
+        cognition: Mapping[str, Any],
+        pointer: int | None,
+        *,
+        prefer_unread: bool = False,
+    ) -> str | None:
+        paths = self._sequence(cognition, "candidate_paths")
+        if paths:
+            start = int(pointer or 0) % len(paths)
+            ordered = [paths[(start + offset) % len(paths)] for offset in range(len(paths))]
+            if prefer_unread:
+                for path in ordered:
+                    if path not in self._read_paths:
+                        return path
+            return ordered[0]
         raw = cognition.get("candidate_locations", ())
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
             return None
@@ -50,8 +86,16 @@ class RWKVSemanticBackbone:
             rendered = str(path).strip()
             if not rendered or rendered in {".", "/"} or Path(rendered).is_absolute():
                 continue
+            if prefer_unread and rendered in self._read_paths:
+                continue
             return rendered
         return None
+
+    def _candidate_query(self, cognition: Mapping[str, Any], pointer: int | None) -> str | None:
+        queries = self._sequence(cognition, "candidate_queries")
+        if not queries:
+            return None
+        return queries[int(pointer or 0) % len(queries)]
 
     def _ingest_delta(
         self,
@@ -88,9 +132,11 @@ class RWKVSemanticBackbone:
         if not isinstance(payload, Mapping):
             raise ValueError("semantic RWKV prompt must be an object")
         goal = str(payload.get("goal") or "")
-        cognition = payload.get("cognition", {})
-        if not isinstance(cognition, Mapping):
-            cognition = {}
+        cognition_raw = payload.get("cognition", {})
+        cognition = (
+            dict(cognition_raw) if isinstance(cognition_raw, Mapping) else {}
+        )
+        cognition = dict(self._ensure_retrieval(goal, cognition))
         recent = payload.get("recent_observations", ())
         if not isinstance(recent, Sequence) or isinstance(recent, (str, bytes)):
             recent = ()
@@ -101,39 +147,49 @@ class RWKVSemanticBackbone:
             self._last_action = None
             self._last_observation_id = None
             self._step = 0
+            self._read_paths = set()
             self.policy.reset(goal, solution)
         else:
             self._ingest_delta(recent, solution)
 
         self._step += 1
         choice = dict(self.policy.choose(goal, solution, recent, self._step))
-        controller = choice.get("controller")
-        action = choice.get("action")
-        if isinstance(action, Mapping) and action.get("name") == "repo.read":
-            path = self._candidate_path(cognition)
-            if path:
-                choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
-            else:
-                choice["action"] = {"name": "repo.search", "inputs": {"query": goal}}
-                choice["controller"] = {
-                    **(dict(controller) if isinstance(controller, Mapping) else {}),
-                    "fallback_from": "repo.read",
-                    "fallback_reason": "no valid candidate file path",
-                }
-        elif isinstance(controller, Mapping) and controller.get("fallback_from") == "repo.read":
-            path = self._candidate_path(cognition)
-            if path:
-                choice["action"] = {"name": "repo.read", "inputs": {"path": path}}
-                choice["controller"] = {**dict(controller), "fallback_resolved": True}
-            else:
-                choice["action"] = {"name": "repo.search", "inputs": {"query": goal}}
-                choice["controller"] = {
-                    **dict(controller),
-                    "fallback_resolved": False,
-                    "fallback_reason": "no valid candidate file path",
-                }
+        controller_raw = choice.get("controller")
+        controller = dict(controller_raw) if isinstance(controller_raw, Mapping) else {}
+        pointer_raw = controller.get("pointer_index")
+        pointer = int(pointer_raw) if isinstance(pointer_raw, int) else None
+        action_raw = choice.get("action")
+        action = dict(action_raw) if isinstance(action_raw, Mapping) else None
 
-        action = choice.get("action")
+        if action is not None:
+            name = str(action.get("name") or "")
+            inputs = dict(action.get("inputs", {})) if isinstance(action.get("inputs"), Mapping) else {}
+            if name == "repo.search":
+                query = self._candidate_query(cognition, pointer)
+                if query:
+                    inputs["query"] = query
+                    controller["retrieval_query"] = query
+            elif name == "repo.read":
+                path = self._candidate_path(cognition, pointer, prefer_unread=True)
+                if path:
+                    inputs = {"path": path}
+                    self._read_paths.add(path)
+                    controller["retrieval_path"] = path
+                else:
+                    query = self._candidate_query(cognition, pointer) or goal
+                    name = "repo.search"
+                    inputs = {"query": query}
+                    controller["fallback_from"] = "repo.read"
+                    controller["fallback_reason"] = "no valid candidate file path"
+            elif name in {"repo.replace", "repo.edit"}:
+                path = self._candidate_path(cognition, pointer)
+                if path:
+                    inputs["path"] = path
+                    controller["retrieval_path"] = path
+            action = {"name": name, "inputs": inputs}
+            choice["action"] = action
+            choice["controller"] = controller
+
         self._last_action = dict(action) if isinstance(action, Mapping) else None
         text = json.dumps(choice, sort_keys=True, ensure_ascii=False)
         return tuple(BackboneSample(text, 0.0) for _ in range(max(1, int(branches))))
