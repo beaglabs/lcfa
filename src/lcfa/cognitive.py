@@ -1,15 +1,16 @@
 """Cognitive working-state construction over the LCFA semantic graph."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import re
 from typing import Any, Mapping, Sequence
 
 from .protocol import EvidenceRef, Finding, Recommendation, SolutionState
-from .semantic_graph import ConceptEdge, ConceptNode, SQLiteSemanticGraph
+from .repo_retrieval import build_retrieval_context
+from .semantic_graph import ConceptNode, SQLiteSemanticGraph
 from .state import content_hash
 
-COGNITIVE_STATE_FORMAT = "lcfa.cognition.v1"
+COGNITIVE_STATE_FORMAT = "lcfa.cognition.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,8 @@ class CognitiveState:
     hypotheses: tuple[Hypothesis, ...]
     open_questions: tuple[str, ...] = ()
     candidate_locations: tuple[str, ...] = ()
+    candidate_queries: tuple[str, ...] = ()
+    candidate_paths: tuple[str, ...] = ()
     observations: tuple[Mapping[str, Any], ...] = ()
     next_actions: tuple[Mapping[str, Any], ...] = ()
     terminal: bool = False
@@ -55,22 +58,8 @@ def _node_terms(node: ConceptNode) -> set[str]:
     return _tokens(text)
 
 
-def _score(issue_terms: set[str], node: ConceptNode) -> float:
-    terms = _node_terms(node)
-    overlap = len(issue_terms & terms)
-    if overlap == 0:
-        return 0.0
-    kind_weight = {
-        "method": 1.35, "function": 1.3, "class": 1.25, "type": 1.2,
-        "module": 1.1, "file": 1.0, "package": 0.9, "callable_ref": 0.75,
-    }.get(node.kind, 0.8)
-    precision = overlap / max(1, len(terms))
-    recall = overlap / max(1, len(issue_terms))
-    return kind_weight * (overlap + 0.5 * precision + 0.75 * recall)
-
-
 class SemanticInvestigator:
-    """Deterministic first-pass localizer/hypothesis builder for later latent control."""
+    """Deterministic first-pass localizer/hypothesis builder for later recurrent control."""
 
     def __init__(self, graph: SQLiteSemanticGraph) -> None:
         self.graph = graph
@@ -93,21 +82,24 @@ class SemanticInvestigator:
         return expanded
 
     def investigate(self, issue: str, *, limit: int = 12) -> SolutionState:
-        issue_terms = _tokens(issue)
-        raw = self.graph.search(issue, limit=max(limit * 4, 30))
-        ranked = sorted(
-            ((node, _score(issue_terms, node)) for node in raw),
-            key=lambda item: (-item[1], item[0].kind, item[0].label),
+        retrieval = build_retrieval_context(
+            self.graph,
+            issue,
+            candidate_limit=max(limit, 16),
         )
-        primary = [node for node, score in ranked if score > 0][:limit]
-        candidates = self._expand(primary[: max(3, min(6, len(primary)))]) if primary else []
-        by_id: dict[str, ConceptNode] = {node.id: node for node in [*primary, *candidates]}
-        ordered = sorted(
-            by_id.values(), key=lambda node: (-_score(issue_terms, node), node.kind, node.label)
-        )[: max(limit, 12)]
+        primary: list[ConceptNode] = []
+        for candidate in retrieval.candidates:
+            try:
+                primary.append(self.graph.get_node(candidate.concept_id))
+            except KeyError:
+                continue
+        expanded = self._expand(primary[: max(3, min(6, len(primary)))]) if primary else []
+        by_id: dict[str, ConceptNode] = {node.id: node for node in [*primary, *expanded]}
+        ordered = list(by_id.values())[: max(limit, 12)]
 
+        issue_terms = _tokens(issue)
         hypotheses: list[Hypothesis] = []
-        location_kinds = {"method", "function", "class", "module", "file"}
+        location_kinds = {"method", "function", "class", "module", "file", "ast_call", "ast_identifier"}
         locations = [node for node in ordered if node.kind in location_kinds]
         for index, node in enumerate(locations[:5], start=1):
             supporting = [node.id]
@@ -115,7 +107,8 @@ class SemanticInvestigator:
                 edge.target if edge.source == node.id else edge.source
                 for edge in self.graph.neighbors(node.id, limit=4)
             )
-            confidence = min(0.90, 0.35 + 0.08 * max(1, len(issue_terms & _node_terms(node))))
+            overlap = len(issue_terms & _node_terms(node))
+            confidence = min(0.95, 0.45 + 0.08 * max(1, overlap))
             hypotheses.append(Hypothesis(
                 id=f"H{index}",
                 claim=f"The issue is likely connected to {node.kind} {node.label}.",
@@ -132,22 +125,28 @@ class SemanticInvestigator:
             for node in ordered
         )
         next_actions: list[Mapping[str, Any]] = []
-        for node in locations[:3]:
-            path = node.metadata.get("path")
-            if path:
-                next_actions.append({
-                    "action": "repo.read", "inputs": {"path": str(path)},
-                    "reason": f"Inspect candidate {node.kind} {node.label}",
-                })
+        for candidate in retrieval.candidates[:3]:
+            next_actions.append({
+                "action": "repo.read",
+                "inputs": {"path": candidate.path},
+                "reason": f"Inspect ranked candidate {candidate.kind} {candidate.label}",
+            })
         if not next_actions:
-            next_actions.append({"action": "repo.search", "inputs": {"query": issue}, "reason": "Broaden repository localization"})
+            query = retrieval.queries[0] if retrieval.queries else issue
+            next_actions.append({
+                "action": "repo.search",
+                "inputs": {"query": query},
+                "reason": "Broaden repository localization",
+            })
 
         cognition = CognitiveState(
             goal=issue,
             active_concepts=tuple(node.id for node in ordered),
             hypotheses=tuple(hypotheses),
             open_questions=(("Which candidate best explains the observed failure?",) if hypotheses else ("Which repository concepts implement the requested behavior?",)),
-            candidate_locations=tuple(node.id for node in locations),
+            candidate_locations=tuple(candidate.concept_id for candidate in retrieval.candidates),
+            candidate_queries=retrieval.queries,
+            candidate_paths=retrieval.candidate_paths,
             next_actions=tuple(next_actions),
             terminal=False,
         )
@@ -172,7 +171,11 @@ class SemanticInvestigator:
             recommendations=recommendations,
             evidence=evidence,
             metadata={
-                "semantic_runtime": {"schema": COGNITIVE_STATE_FORMAT, "concept_count": len(ordered)},
+                "semantic_runtime": {
+                    "schema": COGNITIVE_STATE_FORMAT,
+                    "concept_count": len(ordered),
+                    "retrieval": retrieval.to_dict(),
+                },
                 "language": "",
             },
         )
