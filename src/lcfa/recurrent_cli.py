@@ -1,10 +1,11 @@
-"""CLI for LCFA recurrent-controller datasets, training, and evaluation."""
+"""CLI for LCFA recurrent-controller collection, datasets, training, and evaluation."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 
+from .recurrent_collect import collect_trajectories
 from .recurrent_eval import evaluate_rwkv_heads
 from .recurrent_train import train_rwkv_heads
 from .recurrent_transitions import prepare_transition_file
@@ -14,9 +15,27 @@ from .rwkv_controller import DEFAULT_RWKV_MODEL
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lcfa-recurrent",
-        description="Prepare LCFA semantic trajectories and train/evaluate recurrent RWKV policy heads.",
+        description="Collect/prepare LCFA trajectories and train/evaluate recurrent RWKV policy heads.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    collect = sub.add_parser(
+        "collect",
+        help="run a semantic teacher over JSONL coding tasks in isolated git worktrees",
+    )
+    collect.add_argument("tasks", help="JSONL tasks with repo, goal, base_ref, and verify_argv")
+    collect.add_argument("--artifact", required=True, help="semantic teacher stochastic artifact")
+    collect.add_argument("--output-dir", "-o", required=True)
+    collect.add_argument("--worktree-root", default="/tmp/lcfa-recurrent-worktrees")
+    collect.add_argument("--max-steps", type=int, default=12)
+    collect.add_argument("--max-tasks", type=int)
+    collect.add_argument("--allow-docs", action="store_true")
+    collect.add_argument("--keep-worktrees", action="store_true")
+    collect.add_argument(
+        "--allow-baseline-pass",
+        action="store_true",
+        help="collect tasks even when verify_argv already passes before the agent",
+    )
 
     prepare = sub.add_parser("prepare", help="convert semantic episode JSON files into transition JSONL")
     prepare.add_argument("episodes", nargs="+")
@@ -53,6 +72,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "collect":
+        summary = collect_trajectories(
+            args.tasks,
+            artifact=args.artifact,
+            output_dir=args.output_dir,
+            worktree_root=args.worktree_root,
+            max_steps=args.max_steps,
+            allow_docs=args.allow_docs,
+            keep_worktrees=args.keep_worktrees,
+            require_baseline_failure=not args.allow_baseline_pass,
+            max_tasks=args.max_tasks,
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+
     if args.command == "prepare":
         count = prepare_transition_file(args.episodes, args.output)
         print(json.dumps({"transitions": count, "output": args.output}, indent=2))
