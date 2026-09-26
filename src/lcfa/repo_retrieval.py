@@ -184,18 +184,18 @@ def build_retrieval_context(
     for rank, query in enumerate(queries):
         query_weight = max(1.0, 4.0 - rank * 0.35)
 
-        # Give issue-named files/modules their own retrieval lane before
-        # high-frequency identifier matches can dominate the candidate pool.
+        # An issue that literally names a file/module concept is unusually
+        # strong evidence. Give that lane enough weight to beat many incidental
+        # identifier occurrences in helper files.
         for node in graph.search(query, kinds=("file", "module"), limit=64):
             path = _path(node)
             if not path:
                 continue
-            q = query.casefold()
             normalized_path = path.casefold().replace("-", "_")
-            normalized_query = q.replace("-", "_")
-            path_score = 8.0 * query_weight
+            normalized_query = query.casefold().replace("-", "_")
+            path_score = 12.0 * query_weight
             if normalized_query in normalized_path:
-                path_score = 18.0 * query_weight
+                path_score = 50.0 * query_weight
             add(node, path_score, f"direct-path:{query}")
 
         exact_ids = (
