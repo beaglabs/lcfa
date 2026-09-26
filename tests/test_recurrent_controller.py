@@ -12,12 +12,14 @@ from lcfa import (
     episode_to_transitions,
     load_transitions,
     prepare_transition_file,
+    split_transitions,
+    summarize_predictions,
 )
 
 
-def _episode(*, success=None):
+def _episode(*, success=None, episode_id="semantic-episode:test"):
     value = {
-        "id": "semantic-episode:test",
+        "id": episode_id,
         "goal": "Fix Optional name normalization",
         "steps": [
             {
@@ -70,6 +72,60 @@ def test_prepare_transition_file_round_trips_jsonl(tmp_path: Path) -> None:
     assert len(rows) == 2
     assert rows[0].value_target == 0.0
     assert rows[-1].target_action == "stop"
+
+
+def test_validation_split_keeps_whole_episodes_together() -> None:
+    rows = (
+        *episode_to_transitions(_episode(episode_id="episode:a")),
+        *episode_to_transitions(_episode(episode_id="episode:b")),
+        *episode_to_transitions(_episode(episode_id="episode:c")),
+        *episode_to_transitions(_episode(episode_id="episode:d")),
+        *episode_to_transitions(_episode(episode_id="episode:e")),
+    )
+    train, validation = split_transitions(rows, validation_fraction=0.2, seed=7)
+    train_ids = {row.episode_id for row in train}
+    validation_ids = {row.episode_id for row in validation}
+    assert len(validation_ids) == 1
+    assert train_ids.isdisjoint(validation_ids)
+    assert len(train_ids) == 4
+    assert len(validation) == 2
+
+
+def test_one_episode_validation_split_stays_train_only() -> None:
+    rows = episode_to_transitions(_episode())
+    train, validation = split_transitions(rows, validation_fraction=0.2)
+    assert train == rows
+    assert validation == ()
+
+
+def test_prediction_summary_reports_fresh_action_stop_and_episode_accuracy() -> None:
+    predictions = [
+        {
+            "episode_id": "a", "step_index": 1,
+            "target_action": "repo.search", "predicted_action": "repo.search",
+            "action_correct": True, "target_stop": False, "predicted_stop": False,
+            "stop_correct": True, "value_target": 1.0, "predicted_value": 0.8,
+        },
+        {
+            "episode_id": "a", "step_index": 2,
+            "target_action": "stop", "predicted_action": "stop",
+            "action_correct": True, "target_stop": True, "predicted_stop": True,
+            "stop_correct": True, "value_target": 1.0, "predicted_value": 0.9,
+        },
+        {
+            "episode_id": "b", "step_index": 1,
+            "target_action": "repo.read", "predicted_action": "repo.search",
+            "action_correct": False, "target_stop": False, "predicted_stop": False,
+            "stop_correct": True, "value_target": 0.0, "predicted_value": 0.2,
+        },
+    ]
+    summary = summarize_predictions(predictions)
+    assert summary["action_accuracy"] == 2 / 3
+    assert summary["stop_accuracy"] == 1.0
+    assert summary["exact_episode_accuracy"] == 0.5
+    assert abs(summary["value_mae"] - (0.2 + 0.1 + 0.2) / 3) < 1e-9
+    assert summary["per_action"]["repo.search"]["accuracy"] == 1.0
+    assert summary["per_action"]["repo.read"]["accuracy"] == 0.0
 
 
 class _FakeRecurrentPolicy:

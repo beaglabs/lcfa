@@ -6,12 +6,12 @@ control information before recurrent-backbone fine-tuning.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 import json
 from pathlib import Path
 import random
 from typing import Any, Mapping
 
+from .recurrent_eval import evaluate_loaded_heads, group_episodes, split_transitions
 from .recurrent_transitions import ACTION_VOCAB, RecurrentTransition, load_transitions
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError
 
@@ -44,13 +44,6 @@ def _event_text(row: RecurrentTransition) -> str:
     return json.dumps(row.event, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-def _group(rows: tuple[RecurrentTransition, ...]) -> list[list[RecurrentTransition]]:
-    grouped: dict[str, list[RecurrentTransition]] = defaultdict(list)
-    for row in rows:
-        grouped[row.episode_id].append(row)
-    return [sorted(values, key=lambda item: item.step_index) for values in grouped.values()]
-
-
 def train_rwkv_heads(
     transitions_path: str | Path,
     output_dir: str | Path,
@@ -60,6 +53,7 @@ def train_rwkv_heads(
     learning_rate: float = 1e-3,
     device: str | None = None,
     dtype: str = "bfloat16",
+    validation_fraction: float = 0.2,
     seed: int = 20260925,
 ) -> Mapping[str, Any]:
     try:
@@ -77,6 +71,13 @@ def train_rwkv_heads(
     for row in rows:
         if row.target_action not in ACTION_VOCAB:
             raise ValueError(f"unknown action target: {row.target_action}")
+    train_rows, validation_rows = split_transitions(
+        rows,
+        validation_fraction=validation_fraction,
+        seed=seed,
+    )
+    if not train_rows:
+        raise ValueError("training split is empty")
 
     random.seed(seed)
     torch.manual_seed(seed)
@@ -104,13 +105,13 @@ def train_rwkv_heads(
     heads.train()
     optimizer = torch.optim.AdamW(heads.parameters(), lr=float(learning_rate))
     action_index = {name: index for index, name in enumerate(ACTION_VOCAB)}
-    episodes = _group(rows)
+    episodes = [list(episode) for episode in group_episodes(train_rows)]
 
     total_updates = 0
     last_loss = 0.0
-    action_correct = action_total = 0
-    stop_correct = stop_total = 0
-    value_examples = 0
+    optimization_action_correct = optimization_action_total = 0
+    optimization_stop_correct = optimization_stop_total = 0
+    value_examples = sum(row.value_target is not None for row in train_rows)
 
     for _epoch in range(max(1, int(epochs))):
         random.shuffle(episodes)
@@ -156,7 +157,6 @@ def train_rwkv_heads(
                     loss = loss + torch.nn.functional.binary_cross_entropy_with_logits(
                         value_logit.float(), target_value
                     )
-                    value_examples += 1
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -166,11 +166,31 @@ def train_rwkv_heads(
                 last_loss = float(loss.detach().cpu().item())
 
                 predicted_action = int(torch.argmax(action_logits.detach(), dim=-1)[0].item())
-                action_correct += int(predicted_action == action_index[row.target_action])
-                action_total += 1
+                optimization_action_correct += int(predicted_action == action_index[row.target_action])
+                optimization_action_total += 1
                 predicted_stop = bool(torch.sigmoid(stop_logit.detach().float())[0].item() >= 0.5)
-                stop_correct += int(predicted_stop == row.stop_target)
-                stop_total += 1
+                optimization_stop_correct += int(predicted_stop == row.stop_target)
+                optimization_stop_total += 1
+
+    # These are the metrics that matter: freeze the trained heads and replay
+    # each episode from a fresh recurrent state after all updates are complete.
+    heads.eval()
+    train_evaluation = evaluate_loaded_heads(
+        train_rows,
+        model=model,
+        tokenizer=tokenizer,
+        heads=heads,
+        device=resolved_device,
+        action_names=ACTION_VOCAB,
+    )
+    validation_evaluation = evaluate_loaded_heads(
+        validation_rows,
+        model=model,
+        tokenizer=tokenizer,
+        heads=heads,
+        device=resolved_device,
+        action_names=ACTION_VOCAB,
+    ) if validation_rows else {"summary": None, "predictions": []}
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -179,6 +199,17 @@ def train_rwkv_heads(
         {key: value.detach().cpu().contiguous() for key, value in heads.state_dict().items()},
         str(weights_path),
     )
+    evaluation_payload = {
+        "train": train_evaluation,
+        "validation": validation_evaluation,
+    }
+    (output / "evaluation.json").write_text(
+        json.dumps(evaluation_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    train_summary = train_evaluation["summary"]
+    validation_summary = validation_evaluation.get("summary")
     summary = {
         "format": TRAINING_FORMAT,
         "controller_format": RWKV_CONTROLLER_FORMAT,
@@ -188,13 +219,39 @@ def train_rwkv_heads(
         "epochs": max(1, int(epochs)),
         "learning_rate": float(learning_rate),
         "transitions": len(rows),
-        "episodes": len(episodes),
+        "episodes": len(group_episodes(rows)),
+        "train_transitions": len(train_rows),
+        "train_episodes": len(group_episodes(train_rows)),
+        "validation_transitions": len(validation_rows),
+        "validation_episodes": len(group_episodes(validation_rows)),
+        "validation_fraction": float(validation_fraction),
         "updates": total_updates,
         "final_loss": last_loss,
-        "train_action_accuracy": action_correct / action_total if action_total else 0.0,
-        "train_stop_accuracy": stop_correct / stop_total if stop_total else 0.0,
+        "optimization_action_accuracy": (
+            optimization_action_correct / optimization_action_total
+            if optimization_action_total else 0.0
+        ),
+        "optimization_stop_accuracy": (
+            optimization_stop_correct / optimization_stop_total
+            if optimization_stop_total else 0.0
+        ),
+        "train_action_accuracy": train_summary["action_accuracy"],
+        "train_stop_accuracy": train_summary["stop_accuracy"],
+        "train_exact_episode_accuracy": train_summary["exact_episode_accuracy"],
+        "post_train_action_accuracy": train_summary["action_accuracy"],
+        "post_train_stop_accuracy": train_summary["stop_accuracy"],
+        "validation_action_accuracy": (
+            validation_summary["action_accuracy"] if validation_summary else None
+        ),
+        "validation_stop_accuracy": (
+            validation_summary["stop_accuracy"] if validation_summary else None
+        ),
+        "validation_exact_episode_accuracy": (
+            validation_summary["exact_episode_accuracy"] if validation_summary else None
+        ),
         "value_examples": value_examples,
         "weights": "heads.safetensors",
+        "evaluation": "evaluation.json",
         "backbone_frozen": True,
         "state_api": "rwkv7.state",
         "loader": "transformers-remote-code",
