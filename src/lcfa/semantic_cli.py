@@ -66,6 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     agent.add_argument("--db")
     agent.add_argument("--artifact", required=True)
     agent.add_argument("--max-steps", type=int, default=12)
+    agent.add_argument("--allow-docs", action="store_true", help="enable allowlisted live documentation retrieval")
     agent.add_argument("--auto-approve", action="store_true", help="approve workspace edits/process actions; use only inside an isolated benchmark/worktree")
     agent.add_argument("--output", "-o")
     return parser
@@ -99,10 +100,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         if args.command == "agent":
-            # Ensure the semantic graph reflects the current worktree before the episode.
             PythonRepoIndexer(graph, root).index()
             episode = SemanticWorkspaceAgent.from_artifact(
-                graph, root, args.artifact, max_steps=args.max_steps
+                graph, root, args.artifact, max_steps=args.max_steps, allow_docs=args.allow_docs
             ).run(args.goal, auto_approve=args.auto_approve)
             text = json.dumps(_safe(episode), indent=2, sort_keys=True, ensure_ascii=False)
             if args.output:
