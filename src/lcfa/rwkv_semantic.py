@@ -1,9 +1,7 @@
 """Adapter from the recurrent RWKV controller to SemanticWorkspaceAgent.
 
-SemanticWorkspaceAgent already accepts a stochastic-backbone-shaped policy.
-This adapter preserves that API while making the actual action decision through
-trained recurrent heads; JSON is only the compatibility envelope presented to
-the existing agent loop.
+The semantic agent keeps a structured compatibility envelope, while every
+actual action decision is made by RWKV recurrent state plus trained heads.
 """
 from __future__ import annotations
 
@@ -13,7 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from .backbones import BackboneSample
 from .protocol import SolutionState
-from .rwkv_controller import RWKVRecurrentPolicy
+from .rwkv_controller import RWKVRecurrentPolicy, load_rwkv_policy
 from .semantic_graph import SQLiteSemanticGraph
 
 
@@ -126,30 +124,18 @@ def load_rwkv_semantic_backbone(
     graph: SQLiteSemanticGraph,
     *,
     model_id: str | None = None,
-    device: str | None = None,
-    dtype: str = "bfloat16",
+    device: str | None = "auto",
+    dtype: str = "auto",
 ) -> RWKVSemanticBackbone:
-    root = Path(controller_dir)
-    manifest_path = root / "controller.json" if root.is_dir() else root
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping):
-        raise ValueError("controller manifest must be a JSON object")
-    resolved_root = manifest_path.parent
-    weights = str(raw.get("weights") or "heads.safetensors")
-    resolved_model = str(model_id or raw.get("model_id") or "")
-    if not resolved_model:
-        raise ValueError("controller manifest requires model_id")
-    action_vocab = tuple(raw.get("action_vocab") or ())
-    if not action_vocab:
-        raise ValueError("controller manifest requires action_vocab")
-    policy = RWKVRecurrentPolicy(
-        resolved_model,
-        heads_path=resolved_root / weights,
-        device=device,
-        dtype=dtype,
-        action_names=action_vocab,
+    return RWKVSemanticBackbone(
+        load_rwkv_policy(
+            controller_dir,
+            model_id=model_id,
+            device=device,
+            dtype=dtype,
+        ),
+        graph,
     )
-    return RWKVSemanticBackbone(policy, graph)
 
 
 __all__ = ["RWKVSemanticBackbone", "load_rwkv_semantic_backbone"]
