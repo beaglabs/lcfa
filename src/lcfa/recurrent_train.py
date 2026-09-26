@@ -1,8 +1,8 @@
 """Training for the first LCFA recurrent-controller experiment.
 
 Phase 1 deliberately freezes RWKV-7 and trains only action/stop/value heads.
-This isolates whether the pretrained recurrent state already contains useful
-control information before any expensive recurrent-backbone fine-tuning.
+This isolates whether pretrained recurrent state already contains useful
+control information before recurrent-backbone fine-tuning.
 """
 from __future__ import annotations
 
@@ -41,25 +41,14 @@ def _device(torch: Any, requested: str | None) -> str:
 
 
 def _event_text(row: RecurrentTransition) -> str:
-    return json.dumps(
-        {
-            "goal": row.goal,
-            "event": row.event,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ) + "\n"
+    return json.dumps(row.event, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def _group(rows: tuple[RecurrentTransition, ...]) -> list[list[RecurrentTransition]]:
     grouped: dict[str, list[RecurrentTransition]] = defaultdict(list)
     for row in rows:
         grouped[row.episode_id].append(row)
-    episodes = []
-    for values in grouped.values():
-        episodes.append(sorted(values, key=lambda item: item.step_index))
-    return episodes
+    return [sorted(values, key=lambda item: item.step_index) for values in grouped.values()]
 
 
 def train_rwkv_heads(
@@ -115,37 +104,31 @@ def train_rwkv_heads(
 
     total_updates = 0
     last_loss = 0.0
-    action_correct = 0
-    action_total = 0
-    stop_correct = 0
-    stop_total = 0
+    action_correct = action_total = 0
+    stop_correct = stop_total = 0
     value_examples = 0
 
     for _epoch in range(max(1, int(epochs))):
         random.shuffle(episodes)
         for episode in episodes:
-            cache: Any = None
+            state: Any = None
             for row in episode:
-                encoded = tokenizer(
-                    _event_text(row),
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                )
+                encoded = tokenizer(_event_text(row), return_tensors="pt", add_special_tokens=False)
                 kwargs: dict[str, Any] = {
                     "input_ids": encoded["input_ids"].to(resolved_device),
                     "use_cache": True,
                     "output_hidden_states": True,
                     "return_dict": True,
                 }
-                if cache is not None:
-                    kwargs["past_key_values"] = cache
+                if state is not None:
+                    kwargs["state"] = state
                 with torch.inference_mode():
                     outputs = model(**kwargs)
                 hidden_states = getattr(outputs, "hidden_states", None)
-                cache = getattr(outputs, "past_key_values", None)
-                if not hidden_states or cache is None:
+                state = getattr(outputs, "state", None)
+                if not hidden_states or state is None:
                     raise RWKVControllerError(
-                        "RWKV forward must return hidden_states and recurrent cache"
+                        "RWKV forward must return hidden_states and recurrent state"
                     )
                 hidden = hidden_states[-1][:, -1, :].detach().float()
 
@@ -153,14 +136,10 @@ def train_rwkv_heads(
                 stop_logit = heads["stop"](hidden).squeeze(-1)
                 value_logit = heads["value"](hidden).squeeze(-1)
                 target_action = torch.tensor(
-                    [action_index[row.target_action]],
-                    device=resolved_device,
-                    dtype=torch.long,
+                    [action_index[row.target_action]], device=resolved_device, dtype=torch.long
                 )
                 target_stop = torch.tensor(
-                    [float(row.stop_target)],
-                    device=resolved_device,
-                    dtype=torch.float32,
+                    [float(row.stop_target)], device=resolved_device, dtype=torch.float32
                 )
                 loss = torch.nn.functional.cross_entropy(action_logits, target_action)
                 loss = loss + torch.nn.functional.binary_cross_entropy_with_logits(
@@ -168,9 +147,7 @@ def train_rwkv_heads(
                 )
                 if row.value_target is not None:
                     target_value = torch.tensor(
-                        [float(row.value_target)],
-                        device=resolved_device,
-                        dtype=torch.float32,
+                        [float(row.value_target)], device=resolved_device, dtype=torch.float32
                     )
                     loss = loss + torch.nn.functional.binary_cross_entropy_with_logits(
                         value_logit.float(), target_value
@@ -194,7 +171,10 @@ def train_rwkv_heads(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     weights_path = output / "heads.safetensors"
-    save_file({key: value.detach().cpu().contiguous() for key, value in heads.state_dict().items()}, str(weights_path))
+    save_file(
+        {key: value.detach().cpu().contiguous() for key, value in heads.state_dict().items()},
+        str(weights_path),
+    )
     summary = {
         "format": TRAINING_FORMAT,
         "controller_format": RWKV_CONTROLLER_FORMAT,
@@ -212,11 +192,11 @@ def train_rwkv_heads(
         "value_examples": value_examples,
         "weights": "heads.safetensors",
         "backbone_frozen": True,
+        "state_api": "rwkv7.state",
         "seed": seed,
     }
     (output / "controller.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return summary
 
