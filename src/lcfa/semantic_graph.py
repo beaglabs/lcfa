@@ -170,7 +170,24 @@ class SQLiteSemanticGraph:
                 like = f"%{term}%"
                 params.extend((like, like, like))
             where.append("(" + " OR ".join(term_sql) + ")")
-        sql = "SELECT id FROM nodes" + ((" WHERE " + " AND ".join(where)) if where else "") + " ORDER BY kind, label LIMIT ?"
+        rank = """
+            CASE kind
+              WHEN 'method' THEN 0
+              WHEN 'function' THEN 1
+              WHEN 'class' THEN 2
+              WHEN 'module' THEN 3
+              WHEN 'file' THEN 4
+              WHEN 'ast_call' THEN 5
+              WHEN 'ast_identifier' THEN 6
+              WHEN 'identifier' THEN 7
+              ELSE 8
+            END
+        """
+        sql = (
+            "SELECT id FROM nodes"
+            + ((" WHERE " + " AND ".join(where)) if where else "")
+            + f" ORDER BY {rank}, label LIMIT ?"
+        )
         params.append(max(1, int(limit)))
         return tuple(self.get_node(row["id"]) for row in self.db.execute(sql, params).fetchall())
 
