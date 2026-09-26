@@ -1,9 +1,11 @@
-"""CLI for LCFA recurrent-controller datasets and RWKV head training."""
+"""CLI for LCFA recurrent-controller datasets, training, and evaluation."""
 from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
+from .recurrent_eval import evaluate_rwkv_heads
 from .recurrent_train import train_rwkv_heads
 from .recurrent_transitions import prepare_transition_file
 from .rwkv_controller import DEFAULT_RWKV_MODEL
@@ -12,7 +14,7 @@ from .rwkv_controller import DEFAULT_RWKV_MODEL
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lcfa-recurrent",
-        description="Prepare LCFA semantic trajectories and train recurrent RWKV policy heads.",
+        description="Prepare LCFA semantic trajectories and train/evaluate recurrent RWKV policy heads.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -28,7 +30,24 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--device")
     train.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    train.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        help="episode-level held-out fraction; one-episode datasets remain train-only",
+    )
     train.add_argument("--seed", type=int, default=20260925)
+
+    evaluate = sub.add_parser(
+        "evaluate",
+        help="replay a transition dataset from fresh recurrent states using a trained controller",
+    )
+    evaluate.add_argument("transitions")
+    evaluate.add_argument("--controller", required=True)
+    evaluate.add_argument("--model", help="override controller manifest model_id")
+    evaluate.add_argument("--device")
+    evaluate.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    evaluate.add_argument("--output", "-o")
     return parser
 
 
@@ -39,6 +58,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"transitions": count, "output": args.output}, indent=2))
         return 0
 
+    if args.command == "evaluate":
+        result = evaluate_rwkv_heads(
+            args.transitions,
+            args.controller,
+            model_id=args.model,
+            device=args.device,
+            dtype=args.dtype,
+        )
+        text = json.dumps(result, indent=2, sort_keys=True)
+        if args.output:
+            Path(args.output).write_text(text + "\n", encoding="utf-8")
+        else:
+            print(text)
+        return 0
+
     summary = train_rwkv_heads(
         args.transitions,
         args.output_dir,
@@ -47,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         learning_rate=args.learning_rate,
         device=args.device,
         dtype=args.dtype,
+        validation_fraction=args.validation_fraction,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
