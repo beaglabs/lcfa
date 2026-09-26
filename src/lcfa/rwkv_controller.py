@@ -1,9 +1,9 @@
 """RWKV-7 recurrent policy controller for LCFA semantic agents.
 
-The controller uses RWKV's constant-size recurrent cache as working cognition.
+The controller uses RWKV's constant-size recurrent state as working cognition.
 Action, stop, and value are predicted by small task heads instead of language
-JSON.  The same RWKV language head is retained only for arguments that cannot
-be derived deterministically (for example a source edit).
+JSON. The same RWKV language head is retained only for arguments that cannot be
+derived deterministically (for example a source edit).
 
 Torch/Transformers are optional and imported lazily so the base LCFA runtime
 and CI remain lightweight.
@@ -148,7 +148,7 @@ class RWKVRecurrentPolicy:
         if heads_path is not None:
             self.load_heads(heads_path)
 
-        self._cache: Any = None
+        self._state: Any = None
         self._hidden: Any = None
         self._goal = ""
         self.metadata = {
@@ -178,38 +178,28 @@ class RWKVRecurrentPolicy:
     def _forward_event(self, payload: Mapping[str, Any]) -> None:
         torch = self._torch
         text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
-        encoded = self.tokenizer(
-            text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
+        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         kwargs: dict[str, Any] = {
-            "input_ids": input_ids,
+            "input_ids": encoded["input_ids"].to(self.device),
             "use_cache": True,
             "output_hidden_states": True,
             "return_dict": True,
         }
-        if attention_mask is not None:
-            kwargs["attention_mask"] = attention_mask
-        if self._cache is not None:
-            kwargs["past_key_values"] = self._cache
+        if self._state is not None:
+            kwargs["state"] = self._state
         with torch.inference_mode():
             outputs = self.model(**kwargs)
         hidden_states = getattr(outputs, "hidden_states", None)
         if not hidden_states:
             raise RWKVControllerError("RWKV forward did not return hidden_states")
-        cache = getattr(outputs, "past_key_values", None)
-        if cache is None:
-            raise RWKVControllerError("RWKV forward did not return recurrent cache")
-        self._cache = cache
+        state = getattr(outputs, "state", None)
+        if state is None:
+            raise RWKVControllerError("RWKV forward did not return recurrent state")
+        self._state = state
         self._hidden = hidden_states[-1][:, -1, :].detach()
 
     def reset(self, goal: str, solution: SolutionState) -> None:
-        self._cache = None
+        self._state = None
         self._hidden = None
         self._goal = str(goal)
         self._forward_event({
@@ -223,11 +213,11 @@ class RWKVRecurrentPolicy:
             raise RWKVControllerError("controller has not been reset")
         torch = self._torch
         with torch.inference_mode():
-            action_logits = self.heads["action"](self._hidden)
-            action_probs = torch.softmax(action_logits.float(), dim=-1)[0]
+            action_logits = self.heads["action"](self._hidden.float())
+            action_probs = torch.softmax(action_logits, dim=-1)[0]
             action_index = int(torch.argmax(action_probs).item())
-            stop_probability = float(torch.sigmoid(self.heads["stop"](self._hidden).float())[0, 0].item())
-            value = float(torch.sigmoid(self.heads["value"](self._hidden).float())[0, 0].item())
+            stop_probability = float(torch.sigmoid(self.heads["stop"](self._hidden.float()))[0, 0].item())
+            value = float(torch.sigmoid(self.heads["value"](self._hidden.float()))[0, 0].item())
         return RecurrentDecision(
             action=self.action_names[action_index],
             action_confidence=float(action_probs[action_index].item()),
@@ -239,11 +229,8 @@ class RWKVRecurrentPolicy:
         cognition = _compact_cognition(solution)
         for concept_id in cognition.get("candidate_locations", ()):
             text = str(concept_id)
-            # Semantic concept IDs are typically repo://<path>#<symbol>.  This
-            # fallback is intentionally conservative; the semantic agent can
-            # provide richer path resolution later through its graph.
-            if text.startswith("repo://"):
-                path = text.removeprefix("repo://").split("#", 1)[0]
+            if text.startswith("file://"):
+                path = text.split("/", 3)[-1]
                 if path:
                     return path
         return None
@@ -282,7 +269,8 @@ class RWKVRecurrentPolicy:
             f"cognition={json.dumps(_compact_cognition(solution), ensure_ascii=False, default=str)}\n"
             f"recent={json.dumps(list(recent)[-3:], ensure_ascii=False, default=str)}\n"
         )
-        encoded = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        encoded = self.tokenizer(prompt, return_tensors="pt")
+        encoded = {key: value.to(self.device) for key, value in encoded.items()}
         with torch.inference_mode():
             generated = self.model.generate(
                 **encoded,
@@ -325,8 +313,6 @@ class RWKVRecurrentPolicy:
         if inputs is None:
             inputs = self._generate_inputs(decision.action, goal, solution, recent)
         if inputs is None:
-            # Invalid argument rendering should degrade to a safe read-only
-            # localization action, never to an arbitrary shell command.
             return {
                 "hypothesis": None,
                 "action": {"name": "repo.search", "inputs": {"query": goal}},
