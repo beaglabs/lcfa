@@ -4,9 +4,10 @@ Phase 1 deliberately freezes RWKV-7 and trains only action/stop/value heads.
 This isolates whether pretrained recurrent state already contains useful
 control information before recurrent-backbone fine-tuning.
 
-Because the backbone is frozen, recurrent hidden states are computed once and
-cached. Replaying the 1.5B model on every optimization epoch would be identical
-work and is intentionally avoided.
+Because the backbone is frozen, recurrent hidden states are computed once for
+the complete train/validation corpus and cached. Head-training epochs and the
+post-training evaluation reuse those features instead of replaying the 1.5B
+backbone.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import random
 import time
 from typing import Any, Callable, Mapping
 
-from .recurrent_eval import evaluate_loaded_heads, group_episodes, split_transitions
+from .recurrent_eval import evaluate_cached_heads, group_episodes, split_transitions
 from .recurrent_transitions import ACTION_VOCAB, RecurrentTransition, load_transitions
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError
 from .torch_runtime import resolve_device, resolve_dtype
@@ -81,7 +82,9 @@ def train_rwkv_heads(
         raise RWKVControllerError(str(exc)) from exc
 
     epoch_count = max(1, int(epochs))
-    train_episode_groups = [list(episode) for episode in group_episodes(train_rows)]
+    all_episode_groups = [list(episode) for episode in group_episodes(rows)]
+    train_ids = {row.episode_id for row in train_rows}
+    validation_ids = {row.episode_id for row in validation_rows}
     _emit(
         progress,
         "model-load-start",
@@ -91,7 +94,7 @@ def train_rwkv_heads(
         transitions=len(rows),
         train_transitions=len(train_rows),
         validation_transitions=len(validation_rows),
-        train_episodes=len(train_episode_groups),
+        train_episodes=len(group_episodes(train_rows)),
         epochs=epoch_count,
     )
     load_started = time.monotonic()
@@ -124,20 +127,21 @@ def train_rwkv_heads(
     optimizer = torch.optim.AdamW(heads.parameters(), lr=float(learning_rate))
     action_index = {name: index for index, name in enumerate(ACTION_VOCAB)}
 
-    # Frozen RWKV means these recurrent features are invariant across epochs.
-    # Compute each trajectory once, preserving recurrent state within an episode.
+    # Frozen RWKV means these recurrent features are invariant across epochs and
+    # head weights. Cache train and validation features once from fresh episode
+    # states; only train features are exposed to the optimizer.
     feature_started = time.monotonic()
     _emit(
         progress,
         "feature-cache-start",
-        episodes=len(train_episode_groups),
-        transitions=len(train_rows),
+        episodes=len(all_episode_groups),
+        transitions=len(rows),
     )
     cached_episodes: list[list[tuple[RecurrentTransition, Any]]] = []
     cached_tokens = 0
     max_event_tokens = 0
     cached_transitions = 0
-    for episode_index, episode in enumerate(train_episode_groups, start=1):
+    for episode_index, episode in enumerate(all_episode_groups, start=1):
         state: Any = None
         cached_episode: list[tuple[RecurrentTransition, Any]] = []
         for row in episode:
@@ -170,9 +174,9 @@ def train_rwkv_heads(
             progress,
             "feature-cache-progress",
             episode=episode_index,
-            episodes=len(train_episode_groups),
+            episodes=len(all_episode_groups),
             transitions=cached_transitions,
-            total_transitions=len(train_rows),
+            total_transitions=len(rows),
             tokens=cached_tokens,
             max_event_tokens=max_event_tokens,
             elapsed_seconds=time.monotonic() - feature_started,
@@ -185,6 +189,17 @@ def train_rwkv_heads(
         max_event_tokens=max_event_tokens,
         elapsed_seconds=time.monotonic() - feature_started,
     )
+
+    cached_train = [
+        episode
+        for episode in cached_episodes
+        if episode and episode[0][0].episode_id in train_ids
+    ]
+    cached_validation = [
+        episode
+        for episode in cached_episodes
+        if episode and episode[0][0].episode_id in validation_ids
+    ]
 
     total_updates = 0
     last_loss = 0.0
@@ -199,7 +214,7 @@ def train_rwkv_heads(
         epoch_updates = 0
         epoch_action_correct = 0
         epoch_stop_correct = 0
-        random.shuffle(cached_episodes)
+        random.shuffle(cached_train)
         _emit(
             progress,
             "epoch-start",
@@ -207,7 +222,7 @@ def train_rwkv_heads(
             epochs=epoch_count,
             transitions=len(train_rows),
         )
-        for episode in cached_episodes:
+        for episode in cached_train:
             for row, hidden in episode:
                 action_logits = heads["action"](hidden)
                 stop_logit = heads["stop"](hidden).squeeze(-1)
@@ -277,24 +292,18 @@ def train_rwkv_heads(
         train_transitions=len(train_rows),
         validation_transitions=len(validation_rows),
     )
-    train_evaluation = evaluate_loaded_heads(
-        train_rows,
-        model=model,
-        tokenizer=tokenizer,
+    train_evaluation = evaluate_cached_heads(
+        cached_train,
         heads=heads,
-        device=resolved_device,
         action_names=ACTION_VOCAB,
     )
     validation_evaluation = (
-        evaluate_loaded_heads(
-            validation_rows,
-            model=model,
-            tokenizer=tokenizer,
+        evaluate_cached_heads(
+            cached_validation,
             heads=heads,
-            device=resolved_device,
             action_names=ACTION_VOCAB,
         )
-        if validation_rows
+        if cached_validation
         else {"summary": None, "predictions": []}
     )
     _emit(
@@ -377,12 +386,14 @@ def train_rwkv_heads(
         "value_examples": value_examples,
         "feature_cache_tokens": cached_tokens,
         "feature_cache_max_event_tokens": max_event_tokens,
+        "feature_cache_includes_validation": True,
         "epoch_history": epoch_history,
         "elapsed_seconds": time.monotonic() - started,
         "weights": "heads.safetensors",
         "evaluation": "evaluation.json",
         "backbone_frozen": True,
         "backbone_features_cached": True,
+        "evaluation_uses_cached_features": True,
         "state_api": "rwkv7.state",
         "loader": "transformers-remote-code",
         "seed": seed,

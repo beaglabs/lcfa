@@ -1,9 +1,9 @@
 """Post-training evaluation for LCFA recurrent RWKV controllers.
 
-Evaluation always replays each episode from a fresh RWKV recurrent state. This
-avoids the misleading optimization-time accuracy previously accumulated while
-heads were still changing. Splits are episode-level so transitions from one
-trajectory can never leak across train and validation.
+Evaluation replays each episode from a fresh RWKV recurrent state unless the
+caller already owns a cache of frozen-backbone hidden states. Splits are
+episode-level so transitions from one trajectory can never leak across train
+and validation.
 """
 from __future__ import annotations
 
@@ -118,6 +118,67 @@ def summarize_predictions(predictions: Sequence[Mapping[str, Any]]) -> Mapping[s
     }
 
 
+def _prediction_from_hidden(
+    row: RecurrentTransition,
+    hidden: Any,
+    *,
+    heads: Any,
+    action_names: Sequence[str],
+) -> Mapping[str, Any]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RWKVControllerError("RWKV evaluation requires torch") from exc
+    with torch.inference_mode():
+        action_logits = heads["action"](hidden)
+        stop_probability = float(
+            torch.sigmoid(heads["stop"](hidden).float())[0, 0].item()
+        )
+        predicted_value = float(
+            torch.sigmoid(heads["value"](hidden).float())[0, 0].item()
+        )
+    predicted_index = int(torch.argmax(action_logits, dim=-1)[0].item())
+    predicted_action = tuple(action_names)[predicted_index]
+    predicted_stop = stop_probability >= 0.5
+    return {
+        "episode_id": row.episode_id,
+        "step_index": row.step_index,
+        "target_action": row.target_action,
+        "predicted_action": predicted_action,
+        "action_correct": predicted_action == row.target_action,
+        "target_stop": row.stop_target,
+        "predicted_stop": predicted_stop,
+        "stop_probability": stop_probability,
+        "stop_correct": predicted_stop == row.stop_target,
+        "value_target": row.value_target,
+        "predicted_value": predicted_value,
+    }
+
+
+def evaluate_cached_heads(
+    cached_episodes: Sequence[Sequence[tuple[RecurrentTransition, Any]]],
+    *,
+    heads: Any,
+    action_names: Sequence[str] = ACTION_VOCAB,
+) -> Mapping[str, Any]:
+    """Evaluate fixed heads on already-computed frozen RWKV hidden states."""
+    heads.eval()
+    predictions = [
+        _prediction_from_hidden(
+            row,
+            hidden,
+            heads=heads,
+            action_names=action_names,
+        )
+        for episode in cached_episodes
+        for row, hidden in episode
+    ]
+    return {
+        "summary": summarize_predictions(predictions),
+        "predictions": predictions,
+    }
+
+
 def _event_text(row: RecurrentTransition) -> str:
     return json.dumps(row.event, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
 
@@ -160,30 +221,14 @@ def evaluate_loaded_heads(
                     "RWKV forward must return hidden_states and recurrent state"
                 )
             hidden = hidden_states[-1][:, -1, :].detach().float()
-            with torch.inference_mode():
-                action_logits = heads["action"](hidden)
-                stop_probability = float(
-                    torch.sigmoid(heads["stop"](hidden).float())[0, 0].item()
+            predictions.append(
+                _prediction_from_hidden(
+                    row,
+                    hidden,
+                    heads=heads,
+                    action_names=action_names,
                 )
-                predicted_value = float(
-                    torch.sigmoid(heads["value"](hidden).float())[0, 0].item()
-                )
-            predicted_index = int(torch.argmax(action_logits, dim=-1)[0].item())
-            predicted_action = action_names[predicted_index]
-            predicted_stop = stop_probability >= 0.5
-            predictions.append({
-                "episode_id": row.episode_id,
-                "step_index": row.step_index,
-                "target_action": row.target_action,
-                "predicted_action": predicted_action,
-                "action_correct": predicted_action == row.target_action,
-                "target_stop": row.stop_target,
-                "predicted_stop": predicted_stop,
-                "stop_probability": stop_probability,
-                "stop_correct": predicted_stop == row.stop_target,
-                "value_target": row.value_target,
-                "predicted_value": predicted_value,
-            })
+            )
     return {
         "summary": summarize_predictions(predictions),
         "predictions": predictions,
@@ -263,6 +308,7 @@ def evaluate_rwkv_heads(
 
 __all__ = [
     "EVALUATION_FORMAT",
+    "evaluate_cached_heads",
     "evaluate_loaded_heads",
     "evaluate_rwkv_heads",
     "group_episodes",

@@ -7,8 +7,9 @@ recurrent controller: event_t -> action_t / stop_t / value_t.
 The controller event stream intentionally excludes teacher/oracle hypotheses
 and semantic cognition snapshots. Action supervision may only depend on the
 goal plus prior actions/observations that are also available during rollout.
-Large write payloads are summarized so a complete replacement file is not
-re-tokenized on the following recurrent step.
+Large write payloads and observations are compacted before they are fed back
+through RWKV so recurrent state does not repeatedly tokenize whole files,
+diffs, or process logs.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v2"
 LEGACY_RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v1"
+MAX_RECURRENT_TEXT_CHARS = 4096
+MAX_RECURRENT_SEQUENCE_ITEMS = 24
 
 ACTION_VOCAB: tuple[str, ...] = (
     "repo.read",
@@ -65,14 +68,55 @@ def _text_summary(value: str) -> Mapping[str, Any]:
     }
 
 
+def _compact_text(value: str) -> str | Mapping[str, Any]:
+    if len(value) <= MAX_RECURRENT_TEXT_CHARS:
+        return value
+    raw = value.encode("utf-8")
+    half = MAX_RECURRENT_TEXT_CHARS // 2
+    preview = value[:half] + "\n...<truncated>...\n" + value[-half:]
+    return {
+        "preview": preview,
+        "chars": len(value),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "truncated": True,
+    }
+
+
+def _compact_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound arbitrary action observations while preserving useful evidence."""
+    if isinstance(value, str):
+        return _compact_text(value)
+    if isinstance(value, Mapping):
+        if depth >= 8:
+            rendered = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+            return _compact_text(rendered)
+        return {
+            str(key): _compact_value(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        items = list(value)
+        compacted = [
+            _compact_value(item, depth=depth + 1)
+            for item in items[:MAX_RECURRENT_SEQUENCE_ITEMS]
+        ]
+        if len(items) <= MAX_RECURRENT_SEQUENCE_ITEMS:
+            return compacted
+        return {
+            "items": compacted,
+            "total_items": len(items),
+            "truncated": True,
+        }
+    return value
+
+
 def compact_action(action: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
     """Return an action representation safe to feed back into recurrent state.
 
-    Read/search/test actions retain their inputs verbatim. Write actions keep
-    their semantic target and fingerprints of the written text, but not the
-    complete source body. The source itself remains available through prior
-    ``repo.read`` observations, so this removes duplicate token work without
-    hiding repository evidence from the controller.
+    Read/search/test actions retain their inputs. Write actions keep their
+    semantic target and fingerprints of the written text, but not the complete
+    source body.
     """
     if not isinstance(action, Mapping):
         return None
@@ -91,30 +135,79 @@ def compact_action(action: Mapping[str, Any] | None) -> Mapping[str, Any] | None
                 inputs[f"{key}_sha256"] = summary["sha256"]
             elif value is not None:
                 inputs[key] = value
-    return {"name": name, "inputs": inputs}
+    return {"name": name, "inputs": _compact_value(inputs)}
+
+
+def _named_observation(
+    observation: Mapping[str, Any],
+    key: str,
+) -> Any | None:
+    nested = observation.get("observations")
+    if isinstance(nested, Mapping) and key in nested:
+        return nested[key]
+    if key in observation:
+        return observation[key]
+    results = observation.get("results")
+    if isinstance(results, Mapping) and len(results) == 1:
+        return next(iter(results.values()))
+    return None
+
+
+def compact_observation(
+    action: Mapping[str, Any] | None,
+    observation: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """Deduplicate executor envelopes and bound recurrent observation size.
+
+    Oracle/executor observations can contain the same payload in both
+    ``results`` and ``observations``. The recurrent controller only needs one
+    semantic copy. Workspace actions themselves still retain their full output;
+    this compaction affects only the RWKV event stream.
+    """
+    if not isinstance(observation, Mapping):
+        return {}
+    action_name = str(action.get("name") or "") if isinstance(action, Mapping) else ""
+    key_by_action = {
+        "repo.read": "file",
+        "repo.search": "search",
+        "repo.edit": "edit",
+        "repo.replace": "edit",
+        "process.exec": "process",
+        "test.run": "process",
+        "verify.run": "process",
+    }
+    key = key_by_action.get(action_name)
+    if key:
+        payload = _named_observation(observation, key)
+        if payload is not None:
+            return {key: _compact_value(payload)}
+    return dict(_compact_value(observation))
 
 
 def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the rollout-available, compact recurrent event schema.
+    """Return the rollout-available, bounded recurrent event schema.
 
-    Legacy v1 datasets may contain ``hypothesis`` or ``cognition`` fields.
-    They are stripped at load time so old files cannot accidentally reintroduce
-    teacher information into training. Large write payloads are fingerprinted
-    identically during dataset preparation and live rollout.
+    Legacy datasets may contain ``hypothesis`` or ``cognition`` fields. They
+    are stripped at load time so old files cannot accidentally reintroduce
+    teacher information into training. Training and live rollout call this same
+    function, so their recurrent input schema remains identical.
     """
     kind = str(event.get("kind") or "")
     if kind == "goal":
-        return {"kind": "goal", "goal": str(event.get("goal") or "")}
+        return {"kind": "goal", "goal": _compact_text(str(event.get("goal") or ""))}
     if kind == "transition":
+        raw_action = event.get("action") if isinstance(event.get("action"), Mapping) else None
         observation = event.get("observation")
         return {
             "kind": "transition",
-            "action": compact_action(event.get("action") if isinstance(event.get("action"), Mapping) else None),
-            "observation": (
-                dict(observation) if isinstance(observation, Mapping) else {}
+            "action": compact_action(raw_action),
+            "observation": compact_observation(
+                raw_action,
+                observation if isinstance(observation, Mapping) else None,
             ),
         }
-    return dict(event)
+    compacted = _compact_value(event)
+    return dict(compacted) if isinstance(compacted, Mapping) else {"value": compacted}
 
 
 def _episode_success(episode: Mapping[str, Any]) -> float | None:
@@ -163,7 +256,7 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         terminal = bool(step.get("terminal", False))
 
         if position == 1:
-            event: Mapping[str, Any] = {"kind": "goal", "goal": goal}
+            event: Mapping[str, Any] = normalize_event({"kind": "goal", "goal": goal})
         else:
             event = normalize_event({
                 "kind": "transition",
@@ -265,9 +358,12 @@ def prepare_transition_file(episodes: Sequence[str | Path], output: str | Path) 
 __all__ = [
     "ACTION_VOCAB",
     "LEGACY_RECURRENT_TRANSITION_FORMAT",
+    "MAX_RECURRENT_SEQUENCE_ITEMS",
+    "MAX_RECURRENT_TEXT_CHARS",
     "RECURRENT_TRANSITION_FORMAT",
     "RecurrentTransition",
     "compact_action",
+    "compact_observation",
     "dump_transitions",
     "episode_to_transitions",
     "load_episode",
