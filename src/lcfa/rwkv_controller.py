@@ -119,8 +119,6 @@ class RWKVRecurrentPolicy:
         except ValueError as exc:
             raise RWKVControllerError(str(exc)) from exc
 
-        # RWKV-7 is not yet registered in every released Transformers wheel.
-        # The G1j checkpoint ships its own compatible configuration/model code.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id,
             trust_remote_code=True,
@@ -159,6 +157,7 @@ class RWKVRecurrentPolicy:
             "loader": "transformers-remote-code",
             "device": self.device,
             "dtype": self.dtype_name,
+            "event_schema": "goal + prior action/observation only",
         }
 
     def load_heads(self, path: str | Path) -> None:
@@ -201,14 +200,11 @@ class RWKVRecurrentPolicy:
         self._hidden = hidden_states[-1][:, -1, :].detach()
 
     def reset(self, goal: str, solution: SolutionState) -> None:
+        del solution
         self._state = None
         self._hidden = None
         self._goal = str(goal)
-        self._forward_event({
-            "kind": "goal",
-            "goal": self._goal,
-            "cognition": _compact_cognition(solution),
-        })
+        self._forward_event({"kind": "goal", "goal": self._goal})
 
     def decision(self) -> RecurrentDecision:
         if self._hidden is None:
@@ -338,11 +334,11 @@ class RWKVRecurrentPolicy:
         observation: Mapping[str, Any],
         solution: SolutionState,
     ) -> None:
+        del solution
         self._forward_event({
             "kind": "transition",
             "action": dict(action) if isinstance(action, Mapping) else None,
             "observation": dict(observation),
-            "cognition": _compact_cognition(solution),
         })
 
 
