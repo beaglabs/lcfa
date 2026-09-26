@@ -1,8 +1,8 @@
 """Configurable stochastic-flow backbones.
 
-Backbones provide semantic proposal/verifier generation. They are deliberately
-separate from LCFA fast adaptation so inference engines can be swapped without
-changing the ReasoningPlan -> SolutionState contract.
+Backbones provide semantic proposal/verifier generation for legacy/ablation
+experiments. The recurrent semantic-agent path is RWKV-only. Qwen is not a
+supported first-party model family.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .artifact import ArtifactError
+from .model_policy import UnsupportedModelError, reject_qwen_model
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,35 +41,61 @@ class ReferenceBackbone:
 
     metadata = {"type": "reference", "quality": "test-only"}
 
-    def sample(self, *, system_prompt: str, user_prompt: str, branches: int,
-               temperature: float, top_p: float, max_new_tokens: int,
-               seed: int | None = None) -> tuple[BackboneSample, ...]:
+    def sample(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        branches: int,
+        temperature: float,
+        top_p: float,
+        max_new_tokens: int,
+        seed: int | None = None,
+    ) -> tuple[BackboneSample, ...]:
         import json
         del user_prompt, temperature, top_p, max_new_tokens, seed
         if "LCFA_VERIFIER" in system_prompt:
             return (BackboneSample('{"score": 0.75}', -0.01),)
         text = json.dumps({
             "answer": "Grounded LCFA solution preserved by the reference stochastic backbone.",
-            "rationale": "The typed LCFA anchor is retained while the stochastic-flow path is exercised.",
+            "rationale": (
+                "The typed LCFA anchor is retained while the stochastic-flow path is exercised."
+            ),
             "confidence": 0.75,
             "evidence_ids": [],
             "tool_requests": [],
             "final": True,
         })
-        return tuple(BackboneSample(text, -0.05 - index * 0.01) for index in range(max(1, branches)))
+        return tuple(
+            BackboneSample(text, -0.05 - index * 0.01)
+            for index in range(max(1, branches))
+        )
 
 
 class TransformersCausalBackbone:
-    """Local Hugging Face causal-LM adapter."""
+    """Local Hugging Face causal-LM adapter for non-Qwen ablations."""
 
-    def __init__(self, model_path: str | Path, *, device_map: str | Mapping[str, Any] = "auto",
-                 dtype: str = "auto", local_files_only: bool = True,
-                 trust_remote_code: bool = False, max_input_tokens: int = 16384) -> None:
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        device_map: str | Mapping[str, Any] = "auto",
+        dtype: str = "auto",
+        local_files_only: bool = True,
+        trust_remote_code: bool = False,
+        max_input_tokens: int = 16384,
+    ) -> None:
+        try:
+            reject_qwen_model(model_path)
+        except UnsupportedModelError as exc:
+            raise ArtifactError(str(exc)) from exc
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
-            raise ArtifactError("transformers backbone requires `pip install -e '.[transformers]'`") from exc
+            raise ArtifactError(
+                "transformers backbone requires `pip install -e '.[transformers]'`"
+            ) from exc
         self._torch = torch
         self.model_path = str(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -96,7 +123,10 @@ class TransformersCausalBackbone:
         }
 
     def _render(self, system_prompt: str, user_prompt: str) -> str:
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         fn = getattr(self.tokenizer, "apply_chat_template", None)
         if callable(fn):
             try:
@@ -105,19 +135,32 @@ class TransformersCausalBackbone:
                 pass
         return f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n\nASSISTANT:\n"
 
-    def sample(self, *, system_prompt: str, user_prompt: str, branches: int,
-               temperature: float, top_p: float, max_new_tokens: int,
-               seed: int | None = None) -> tuple[BackboneSample, ...]:
+    def sample(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        branches: int,
+        temperature: float,
+        top_p: float,
+        max_new_tokens: int,
+        seed: int | None = None,
+    ) -> tuple[BackboneSample, ...]:
         torch = self._torch
         if seed is not None:
             torch.manual_seed(int(seed))
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(seed))
         prompt = self._render(system_prompt, user_prompt)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_input_tokens)
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_input_tokens,
+        )
         model_device = getattr(self.model, "device", None)
         if model_device is not None:
-            inputs = {k: v.to(model_device) for k, v in inputs.items()}
+            inputs = {key: value.to(model_device) for key, value in inputs.items()}
         branches = max(1, int(branches))
         do_sample = temperature > 0.0
         kwargs: dict[str, Any] = {
@@ -139,7 +182,9 @@ class TransformersCausalBackbone:
                 getattr(outputs, "beam_indices", None),
                 normalize_logits=True,
             )
-        input_length = 1 if self.model.config.is_encoder_decoder else inputs["input_ids"].shape[1]
+        input_length = (
+            1 if self.model.config.is_encoder_decoder else inputs["input_ids"].shape[1]
+        )
         generated = outputs.sequences[:, input_length:]
         result: list[BackboneSample] = []
         for token_row, score_row in zip(generated, transition):
@@ -151,14 +196,13 @@ class TransformersCausalBackbone:
 
 
 class MLXCausalBackbone:
-    """Apple-Silicon-native local backbone through mlx-lm.
-
-    MLX-LM does not currently expose a stable cross-version transition-score API,
-    so stochastic-flow treats per-sample logprob as neutral (0.0) for this
-    adapter and relies on LCFA evidence/verifier/prior scoring.
-    """
+    """Apple-Silicon-native non-Qwen ablation backbone through mlx-lm."""
 
     def __init__(self, model_path: str | Path, *, max_input_tokens: int = 8192) -> None:
+        try:
+            reject_qwen_model(model_path)
+        except UnsupportedModelError as exc:
+            raise ArtifactError(str(exc)) from exc
         try:
             import mlx.core as mx
             from mlx_lm import generate, load
@@ -178,7 +222,10 @@ class MLXCausalBackbone:
         }
 
     def _render(self, system_prompt: str, user_prompt: str) -> str:
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         fn = getattr(self.tokenizer, "apply_chat_template", None)
         if callable(fn):
             try:
@@ -187,13 +234,23 @@ class MLXCausalBackbone:
                 pass
         return f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n\nASSISTANT:\n"
 
-    def sample(self, *, system_prompt: str, user_prompt: str, branches: int,
-               temperature: float, top_p: float, max_new_tokens: int,
-               seed: int | None = None) -> tuple[BackboneSample, ...]:
+    def sample(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        branches: int,
+        temperature: float,
+        top_p: float,
+        max_new_tokens: int,
+        seed: int | None = None,
+    ) -> tuple[BackboneSample, ...]:
         prompt = self._render(system_prompt, user_prompt)
-        # Limit by characters conservatively if tokenizer internals vary across mlx-lm releases.
         prompt = prompt[-self.max_input_tokens * 6:]
-        sampler = self._make_sampler(temp=max(0.0, float(temperature)), top_p=max(1e-5, min(1.0, float(top_p))))
+        sampler = self._make_sampler(
+            temp=max(0.0, float(temperature)),
+            top_p=max(1e-5, min(1.0, float(top_p))),
+        )
         result: list[BackboneSample] = []
         for index in range(max(1, int(branches))):
             if seed is not None:
@@ -211,28 +268,61 @@ class MLXCausalBackbone:
 
 
 class LlamaCppBackbone:
-    """GGUF/llama.cpp local backbone for CPU-oriented deployments."""
+    """GGUF/llama.cpp local backbone for non-Qwen ablations."""
 
-    def __init__(self, model_path: str | Path, *, n_ctx: int = 8192,
-                 n_threads: int | None = None, n_gpu_layers: int = 0) -> None:
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        n_ctx: int = 8192,
+        n_threads: int | None = None,
+        n_gpu_layers: int = 0,
+    ) -> None:
+        try:
+            reject_qwen_model(model_path)
+        except UnsupportedModelError as exc:
+            raise ArtifactError(str(exc)) from exc
         try:
             from llama_cpp import Llama
         except ImportError as exc:
-            raise ArtifactError("llama.cpp backbone requires `pip install -e '.[llama-cpp]'`") from exc
-        kwargs: dict[str, Any] = {"model_path": str(model_path), "n_ctx": int(n_ctx), "n_gpu_layers": int(n_gpu_layers), "verbose": False}
+            raise ArtifactError(
+                "llama.cpp backbone requires `pip install -e '.[llama-cpp]'`"
+            ) from exc
+        kwargs: dict[str, Any] = {
+            "model_path": str(model_path),
+            "n_ctx": int(n_ctx),
+            "n_gpu_layers": int(n_gpu_layers),
+            "verbose": False,
+        }
         if n_threads is not None:
             kwargs["n_threads"] = int(n_threads)
         self.model = Llama(**kwargs)
         self.model_path = str(model_path)
-        self.metadata = {"type": "llama-cpp", "model_path": self.model_path, "n_ctx": int(n_ctx), "n_gpu_layers": int(n_gpu_layers)}
+        self.metadata = {
+            "type": "llama-cpp",
+            "model_path": self.model_path,
+            "n_ctx": int(n_ctx),
+            "n_gpu_layers": int(n_gpu_layers),
+        }
 
-    def sample(self, *, system_prompt: str, user_prompt: str, branches: int,
-               temperature: float, top_p: float, max_new_tokens: int,
-               seed: int | None = None) -> tuple[BackboneSample, ...]:
+    def sample(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        branches: int,
+        temperature: float,
+        top_p: float,
+        max_new_tokens: int,
+        seed: int | None = None,
+    ) -> tuple[BackboneSample, ...]:
         out: list[BackboneSample] = []
         for index in range(max(1, int(branches))):
             response = self.model.create_chat_completion(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
                 temperature=max(0.0, float(temperature)),
                 top_p=max(1e-5, min(1.0, float(top_p))),
                 max_tokens=max(1, int(max_new_tokens)),
@@ -244,16 +334,28 @@ class LlamaCppBackbone:
         return tuple(out)
 
 
-def create_backbone(kind: str, model_path: str | Path | None, *, config: Mapping[str, Any],
-                    runtime: Mapping[str, Any], reference_allowed: bool = False) -> StochasticBackbone:
+def create_backbone(
+    kind: str,
+    model_path: str | Path | None,
+    *,
+    config: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    reference_allowed: bool = False,
+) -> StochasticBackbone:
     kind = str(runtime.get("backbone_type") or kind)
     raw_path = runtime.get("backbone_path") or model_path
     if kind == "reference":
         if not reference_allowed:
-            raise ArtifactError("reference backbone is allowed only for reference_only artifacts")
+            raise ArtifactError(
+                "reference backbone is allowed only for reference_only artifacts"
+            )
         return ReferenceBackbone()
     if raw_path is None:
         raise ArtifactError(f"backbone {kind!r} requires a model path")
+    try:
+        reject_qwen_model(raw_path)
+    except UnsupportedModelError as exc:
+        raise ArtifactError(str(exc)) from exc
     if kind == "transformers-local":
         return TransformersCausalBackbone(
             raw_path,
@@ -264,18 +366,28 @@ def create_backbone(kind: str, model_path: str | Path | None, *, config: Mapping
             max_input_tokens=int(config.get("max_input_tokens", 16384)),
         )
     if kind == "mlx-local":
-        return MLXCausalBackbone(raw_path, max_input_tokens=int(config.get("max_input_tokens", 8192)))
+        return MLXCausalBackbone(
+            raw_path,
+            max_input_tokens=int(config.get("max_input_tokens", 8192)),
+        )
     if kind == "llama-cpp":
         return LlamaCppBackbone(
             raw_path,
             n_ctx=int(runtime.get("n_ctx", config.get("n_ctx", 8192))),
             n_threads=runtime.get("n_threads", config.get("n_threads")),
-            n_gpu_layers=int(runtime.get("n_gpu_layers", config.get("n_gpu_layers", 0))),
+            n_gpu_layers=int(
+                runtime.get("n_gpu_layers", config.get("n_gpu_layers", 0))
+            ),
         )
     raise ArtifactError(f"unsupported stochastic backbone type: {kind!r}")
 
 
 __all__ = [
-    "BackboneSample", "StochasticBackbone", "ReferenceBackbone", "TransformersCausalBackbone",
-    "MLXCausalBackbone", "LlamaCppBackbone", "create_backbone",
+    "BackboneSample",
+    "StochasticBackbone",
+    "ReferenceBackbone",
+    "TransformersCausalBackbone",
+    "MLXCausalBackbone",
+    "LlamaCppBackbone",
+    "create_backbone",
 ]
