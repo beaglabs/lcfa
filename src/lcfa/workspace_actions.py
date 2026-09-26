@@ -1,10 +1,9 @@
 """Governed repository, terminal, test, git, and documentation actions."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import subprocess
-from typing import Any, Mapping
+from typing import Mapping
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -73,7 +72,7 @@ def _repo_search(context: ExecutionContext, inputs: Mapping[str, object]) -> Act
         raise WorkspaceActionError("repo.search requires query")
     limit = max(1, min(int(inputs.get("limit", 50) or 50), 500))
     hits = []
-    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build"}
+    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", ".lcfa"}
     for path in root.rglob("*"):
         if len(hits) >= limit:
             break
@@ -103,6 +102,27 @@ def _repo_edit(context: ExecutionContext, inputs: Mapping[str, object]) -> Actio
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     value = {"path": str(path.relative_to(root)), "bytes_before": len(before.encode()), "bytes_after": len(content.encode())}
+    return ActionResult(value=value, observations={"edit": value})
+
+
+def _repo_replace(context: ExecutionContext, inputs: Mapping[str, object]) -> ActionResult:
+    if "workspace.write" not in context.capabilities:
+        raise WorkspaceActionError("repo.replace requires workspace.write capability")
+    root = _root(context)
+    path = _within(root, str(inputs.get("path", "")))
+    if not path.is_file():
+        raise WorkspaceActionError(f"not a file: {path}")
+    old = inputs.get("old")
+    new = inputs.get("new")
+    if not isinstance(old, str) or not isinstance(new, str) or not old:
+        raise WorkspaceActionError("repo.replace requires non-empty string old and string new")
+    before = path.read_text(encoding="utf-8", errors="replace")
+    count = before.count(old)
+    if count != 1:
+        raise WorkspaceActionError(f"repo.replace requires exactly one match; found {count}")
+    after = before.replace(old, new, 1)
+    path.write_text(after, encoding="utf-8")
+    value = {"path": str(path.relative_to(root)), "replacements": 1, "bytes_before": len(before.encode()), "bytes_after": len(after.encode())}
     return ActionResult(value=value, observations={"edit": value})
 
 
@@ -161,8 +181,9 @@ def _docs_fetch(context: ExecutionContext, inputs: Mapping[str, object]) -> Acti
         if len(data) > max_bytes:
             raise WorkspaceActionError("documentation response exceeds max_bytes")
         charset = response.headers.get_content_charset() or "utf-8"
+        content_type = response.headers.get_content_type()
         text = data.decode(charset, errors="replace")
-    value = {"url": url, "host": host, "content_type": response.headers.get_content_type(), "text": text}
+    value = {"url": url, "host": host, "content_type": content_type, "text": text}
     return ActionResult(value=value, observations={"documentation": value})
 
 
@@ -172,6 +193,7 @@ def register_workspace_actions(registry: ActionRegistry | None = None) -> Action
         ActionSpec("repo.read", _repo_read, description="Read a bounded file range from the workspace."),
         ActionSpec("repo.search", _repo_search, description="Search workspace text without invoking a shell."),
         ActionSpec("repo.edit", _repo_edit, effects=("filesystem.write",), description="Replace one workspace file."),
+        ActionSpec("repo.replace", _repo_replace, effects=("filesystem.write",), description="Replace one exact text span in a workspace file."),
         ActionSpec("process.exec", _process_exec, effects=("process.exec",), description="Execute argv directly without a shell."),
         ActionSpec("test.run", _test_run, effects=("process.exec", "filesystem.write"), description="Run pytest in the workspace."),
         ActionSpec("git.status", _git_status, description="Read repository status."),
@@ -189,6 +211,7 @@ _CAPABILITIES = {
     "git.status": ("workspace.read",),
     "git.diff": ("workspace.read",),
     "repo.edit": ("workspace.write",),
+    "repo.replace": ("workspace.write",),
     "process.exec": ("process.exec",),
     "test.run": ("process.exec",),
     "docs.fetch": ("network.docs",),
@@ -205,7 +228,7 @@ def compile_cognitive_actions(solution: SolutionState) -> ActionGraph:
         action = str(item.get("action", ""))
         if not action:
             continue
-        requires_approval = action in {"repo.edit", "process.exec"}
+        requires_approval = action in {"repo.edit", "repo.replace", "process.exec"}
         node_id = f"semantic-action-{index + 1}"
         nodes.append(ActionNode(
             id=node_id,
