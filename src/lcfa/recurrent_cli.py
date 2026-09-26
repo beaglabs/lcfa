@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+from typing import Any, Mapping
 
 from .recurrent_collect import collect_trajectories
 from .recurrent_eval import evaluate_rwkv_heads
@@ -70,6 +72,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _collection_progress(event: Mapping[str, Any]) -> None:
+    index = event.get("index", "?")
+    total = event.get("total", "?")
+    task_id = event.get("task_id", "?")
+    if event.get("event") == "task-start":
+        print(f"[lcfa] collect {index}/{total} {task_id} start", file=sys.stderr, flush=True)
+        return
+    status = event.get("status", "unknown")
+    success = event.get("success")
+    steps = event.get("steps", 0)
+    elapsed = float(event.get("elapsed_seconds", 0.0) or 0.0)
+    print(
+        f"[lcfa] collect {index}/{total} {task_id} done status={status} "
+        f"success={success} steps={steps} elapsed={elapsed:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "collect":
@@ -83,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             keep_worktrees=args.keep_worktrees,
             require_baseline_failure=not args.allow_baseline_pass,
             max_tasks=args.max_tasks,
+            progress=_collection_progress,
         )
         print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
