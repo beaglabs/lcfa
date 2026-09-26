@@ -15,6 +15,8 @@ import subprocess
 import time
 from typing import Any, Mapping, Sequence
 
+from .artifact import load_artifact_reasoner
+from .engine import LCFA
 from .repo_index import PythonRepoIndexer
 from .semantic_agent import SemanticWorkspaceAgent
 from .semantic_graph import SQLiteSemanticGraph
@@ -66,6 +68,27 @@ class CollectionTaskResult:
     steps: int
     elapsed_seconds: float
     error: str | None = None
+
+
+class _TeacherBackboneCache:
+    """Load the teacher lazily once, then reuse its stateless backbone sequentially."""
+
+    def __init__(self, artifact: Path) -> None:
+        self.artifact = artifact
+        self._backbone: Any = None
+
+    def get(self) -> Any:
+        if self._backbone is None:
+            reasoner = load_artifact_reasoner(
+                self.artifact,
+                base_engine=LCFA(),
+                runtime_options={},
+            )
+            backbone = getattr(reasoner, "backbone", None)
+            if backbone is None:
+                raise CollectionError("teacher artifact must expose a stochastic backbone")
+            self._backbone = backbone
+        return self._backbone
 
 
 def _as_argv(value: Any, *, field: str) -> tuple[str, ...]:
@@ -203,6 +226,7 @@ def _remove_worktree(source_repo: Path, worktree: Path) -> None:
 def _collect_one(
     task: RecurrentCollectionTask,
     *,
+    teacher: _TeacherBackboneCache,
     artifact: Path,
     output_dir: Path,
     worktree_root: Path,
@@ -238,10 +262,10 @@ def _collect_one(
         db_path = worktree / ".lcfa" / "semantic.db"
         with SQLiteSemanticGraph(db_path) as graph:
             PythonRepoIndexer(graph, worktree).index()
-            agent = SemanticWorkspaceAgent.from_artifact(
+            agent = SemanticWorkspaceAgent(
                 graph,
                 worktree,
-                artifact,
+                teacher.get(),
                 max_steps=max_steps,
                 allow_docs=allow_docs,
             )
@@ -303,6 +327,10 @@ def collect_trajectories(
     tasks = list(load_tasks(tasks_path))
     if max_tasks is not None:
         tasks = tasks[: max(0, int(max_tasks))]
+    safe_ids = [_safe_id(task.id) for task in tasks]
+    if len(set(safe_ids)) != len(safe_ids):
+        raise ValueError("task ids collide after filesystem-safe normalization")
+
     artifact_path = Path(artifact).expanduser().resolve()
     if not artifact_path.exists():
         raise CollectionError(f"teacher artifact does not exist: {artifact_path}")
@@ -310,10 +338,12 @@ def collect_trajectories(
     worktrees = Path(worktree_root).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     worktrees.mkdir(parents=True, exist_ok=True)
+    teacher = _TeacherBackboneCache(artifact_path)
 
     results = [
         _collect_one(
             task,
+            teacher=teacher,
             artifact=artifact_path,
             output_dir=output,
             worktree_root=worktrees,
