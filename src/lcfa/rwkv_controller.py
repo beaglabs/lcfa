@@ -1,9 +1,9 @@
 """RWKV-7 recurrent policy controller for LCFA semantic agents.
 
 Action, stop, value, and optional retrieval-pointer decisions are predicted
-from RWKV recurrent state. Search/read arguments are resolved from the same
-ranked retrieval context used during training. The language head is reserved
-for edit/process arguments that cannot be resolved deterministically.
+from RWKV recurrent state. Search/read arguments resolve from the same ranked
+retrieval context used during training. Language generation is reserved for
+edit/process arguments that cannot be resolved deterministically.
 """
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from typing import Any, Mapping, Protocol, Sequence
 from .protocol import SolutionState
 from .recurrent_transitions import ACTION_VOCAB, normalize_event
 from .torch_runtime import resolve_device, resolve_dtype
-
 
 RWKV_CONTROLLER_FORMAT = "lcfa.rwkv-controller.v2"
 DEFAULT_RWKV_MODEL = "RWKV/RWKV7-G1j-1.5B-20260831"
@@ -142,8 +141,7 @@ class RWKVRecurrentPolicy:
             raise RWKVControllerError(str(exc)) from exc
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_id,
-            trust_remote_code=True,
+            self.model_id, trust_remote_code=True
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
@@ -152,11 +150,15 @@ class RWKVRecurrentPolicy:
         ).to(self.device)
         if backbone_weights_path is not None:
             try:
-                from safetensors.torch import load_file
+                from safetensors.torch import load_model
             except ImportError as exc:
                 raise RWKVControllerError("safetensors torch support is required") from exc
-            backbone_state = load_file(str(backbone_weights_path), device=self.device)
-            missing, unexpected = self.model.load_state_dict(backbone_state, strict=False)
+            missing, unexpected = load_model(
+                self.model,
+                str(backbone_weights_path),
+                strict=False,
+                device=self.device,
+            )
             if missing or unexpected:
                 raise RWKVControllerError(
                     "backbone tensor mismatch: "
@@ -218,10 +220,12 @@ class RWKVRecurrentPolicy:
 
     def _forward_event(self, payload: Mapping[str, Any]) -> None:
         torch = self._torch
-        payload = normalize_event(payload)
-        self._event_history.append(payload)
+        event = normalize_event(payload)
+        self._event_history.append(event)
         self._event_history = self._event_history[-8:]
-        text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
+        text = json.dumps(
+            event, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         kwargs: dict[str, Any] = {
             "input_ids": encoded["input_ids"].to(self.device),
@@ -234,11 +238,11 @@ class RWKVRecurrentPolicy:
         with torch.inference_mode():
             outputs = self.model(**kwargs)
         hidden_states = getattr(outputs, "hidden_states", None)
-        if not hidden_states:
-            raise RWKVControllerError("RWKV forward did not return hidden_states")
         state = getattr(outputs, "state", None)
-        if state is None:
-            raise RWKVControllerError("RWKV forward did not return recurrent state")
+        if not hidden_states or state is None:
+            raise RWKVControllerError(
+                "RWKV forward must return hidden_states and recurrent state"
+            )
         self._state = state
         self._hidden = hidden_states[-1][:, -1, :].detach()
 
@@ -268,12 +272,15 @@ class RWKVRecurrentPolicy:
             stop_probability = float(
                 torch.sigmoid(self.heads["stop"](self._hidden.float()))[0, 0].item()
             )
-            value = float(torch.sigmoid(self.heads["value"](self._hidden.float()))[0, 0].item())
-            pointer_index: int | None = None
-            pointer_confidence: float | None = None
+            value = float(
+                torch.sigmoid(self.heads["value"](self._hidden.float()))[0, 0].item()
+            )
+            pointer_index = None
+            pointer_confidence = None
             if "pointer" in self.heads:
-                pointer_logits = self.heads["pointer"](self._hidden.float())
-                pointer_probs = torch.softmax(pointer_logits, dim=-1)[0]
+                pointer_probs = torch.softmax(
+                    self.heads["pointer"](self._hidden.float()), dim=-1
+                )[0]
                 pointer_index = int(torch.argmax(pointer_probs).item())
                 pointer_confidence = float(pointer_probs[pointer_index].item())
         return RecurrentDecision(
@@ -292,27 +299,23 @@ class RWKVRecurrentPolicy:
             return ()
         return tuple(str(item) for item in raw if str(item))
 
-    def _candidate_path(self, solution: SolutionState, pointer: int | None = None) -> str | None:
+    def _candidate_path(
+        self, solution: SolutionState, pointer: int | None = None
+    ) -> str | None:
         cognition = _compact_cognition(solution)
         paths = self._sequence(cognition, "candidate_paths")
         if paths:
-            index = int(pointer or 0) % len(paths)
-            return paths[index]
-        for concept_id in cognition.get("candidate_locations", ()):
-            text = str(concept_id)
-            if text.startswith("file://"):
-                path = text.split("/", 3)[-1]
-                if path:
-                    return path
+            return paths[int(pointer or 0) % len(paths)]
         return None
 
-    def _candidate_query(self, solution: SolutionState, pointer: int | None = None) -> str | None:
+    def _candidate_query(
+        self, solution: SolutionState, pointer: int | None = None
+    ) -> str | None:
         cognition = _compact_cognition(solution)
         queries = self._sequence(cognition, "candidate_queries")
         if not queries:
             return None
-        index = int(pointer or 0) % len(queries)
-        return queries[index]
+        return queries[int(pointer or 0) % len(queries)]
 
     def _default_inputs(
         self,
@@ -339,9 +342,13 @@ class RWKVRecurrentPolicy:
     ) -> Mapping[str, Any] | None:
         torch = self._torch
         target_path = self._candidate_path(solution, pointer)
-        event = self._event_history[-1] if self._event_history else {"kind": "goal", "goal": goal}
+        event = self._event_history[-1] if self._event_history else {
+            "kind": "goal", "goal": goal
+        }
         prompt = argument_prompt(action, goal, event, target_path=target_path)
-        encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        encoded = self.tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=False
+        )
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
         with torch.inference_mode():
             generated = self.model.generate(
@@ -381,22 +388,20 @@ class RWKVRecurrentPolicy:
             "pointer_index": decision.pointer_index,
             "pointer_confidence": decision.pointer_confidence,
         }
-        should_stop = decision.action == "stop" or decision.stop_probability >= self.stop_threshold
-        if should_stop:
-            return {"hypothesis": None, "action": None, "final": True, "controller": controller}
+        if decision.action == "stop" or decision.stop_probability >= self.stop_threshold:
+            return {
+                "hypothesis": None,
+                "action": None,
+                "final": True,
+                "controller": controller,
+            }
 
         inputs = self._default_inputs(
-            decision.action,
-            goal,
-            solution,
-            decision.pointer_index,
+            decision.action, goal, solution, decision.pointer_index
         )
         if inputs is None:
             inputs = self._generate_inputs(
-                decision.action,
-                goal,
-                solution,
-                decision.pointer_index,
+                decision.action, goal, solution, decision.pointer_index
             )
         if inputs is None:
             query = self._candidate_query(solution, decision.pointer_index) or goal
