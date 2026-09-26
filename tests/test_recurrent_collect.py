@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -108,6 +109,42 @@ def test_oracle_collection_replays_known_fix_without_model_teacher(tmp_path: Pat
     assert "verify.run" in actions
     assert actions[-1] == "stop"
     assert "VALUE = 'fixed'" in episode["patch"]
+
+
+def test_oracle_collection_recovers_stale_worktree_registration(tmp_path: Path) -> None:
+    repo, base, fix = _make_repo(tmp_path)
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text(
+        json.dumps({
+            "schema_version": "lcfa.recurrent-task.v2",
+            "id": "stale-worktree",
+            "repo": str(repo),
+            "base_ref": base,
+            "fix_ref": fix,
+            "goal": "Fix VALUE so it equals fixed",
+            "verify_argv": [
+                sys.executable,
+                "-c",
+                "from value import VALUE; assert VALUE == 'fixed'",
+            ],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    worktrees = tmp_path / "worktrees"
+    stale = worktrees / "stale-worktree"
+    worktrees.mkdir()
+    _git(repo, "worktree", "add", "--detach", str(stale), base)
+    shutil.rmtree(stale)
+
+    summary = collect_trajectories(
+        tasks,
+        mode="oracle",
+        output_dir=tmp_path / "episodes",
+        worktree_root=worktrees,
+    )
+    assert summary["collected"] == 1
+    assert summary["successful"] == 1
+    assert summary["errors"] == 0
 
 
 def test_oracle_collection_skips_already_passing_task(tmp_path: Path) -> None:
