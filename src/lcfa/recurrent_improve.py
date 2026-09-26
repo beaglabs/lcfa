@@ -1,10 +1,10 @@
 """Closed-loop recurrent policy improvement for LCFA.
 
-Each round performs exactly the workflow used for scaling repair competence:
-roll out the current controller, retain only verified successful behavior,
-relabel failed visited states with corrective historical-fix targets, merge
-those records with the accumulated training corpus, and train the next
-controller.  No external language-model teacher is used.
+Each round performs the scaling workflow directly in the existing controller:
+roll out the current weights, retain only verified successful behavior, relabel
+failed visited states with corrective historical-fix targets, merge those
+records with the accumulated corpus, and continue training from the current
+controller. No external language-model teacher is used.
 """
 from __future__ import annotations
 
@@ -60,11 +60,9 @@ def improve_controller(
 ) -> Mapping[str, Any]:
     """Run verifier-driven self-improvement over any recurrent task corpus.
 
-    The accumulated transition file is immutable per round; each next round
-    merges the previous corpus with only two new sources:
-      * verified successful self-rollouts;
-      * corrective labels generated from failed rollout states.
-    Failed behavior itself is never added as an imitation target.
+    Each next round initializes from the controller produced by the prior
+    round, while the transition corpus also accumulates verified successes and
+    corrective labels. Failed behavior itself is never an imitation target.
     """
     round_count = max(1, int(rounds))
     tasks = Path(tasks_path).expanduser().resolve()
@@ -148,14 +146,18 @@ def improve_controller(
             rollout_collected=rollout.get("collected"),
             rollout_errors=rollout.get("errors"),
         )
+        resolved_model = (
+            str(model_id)
+            if model_id
+            else str(
+                rollout.get("runtime", {}).get("model_id")
+                or "RWKV/RWKV7-G1j-1.5B-20260831"
+            )
+        )
         training = train_rwkv_heads(
             merged_path,
             next_controller,
-            model_id=(
-                str(model_id)
-                if model_id
-                else str(rollout.get("runtime", {}).get("model_id") or "RWKV/RWKV7-G1j-1.5B-20260831")
-            ),
+            model_id=resolved_model,
             epochs=epochs,
             learning_rate=learning_rate,
             device=device,
@@ -167,6 +169,7 @@ def improve_controller(
             pointer_loss_weight=pointer_loss_weight,
             argument_loss_weight=argument_loss_weight,
             max_argument_chars=max_argument_chars,
+            init_controller=current_controller,
             progress=(
                 (lambda event, r=round_index: _emit(
                     progress, "training-progress", round=r, detail=dict(event)
@@ -195,7 +198,8 @@ def improve_controller(
             "training": {
                 key: training.get(key)
                 for key in (
-                    "backbone_mode", "train_action_accuracy",
+                    "backbone_mode", "init_controller", "init_head_tensors_loaded",
+                    "init_backbone_loaded", "train_action_accuracy",
                     "train_pointer_accuracy", "validation_action_accuracy",
                     "validation_pointer_accuracy", "validation_exact_episode_accuracy",
                     "argument_examples", "pointer_examples", "elapsed_seconds"
