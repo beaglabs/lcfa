@@ -1,4 +1,4 @@
-"""CLI for LCFA semantic repository indexing and investigation."""
+"""CLI for LCFA semantic repository indexing, investigation, and agent execution."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ from typing import Any
 
 from .cognitive import SemanticInvestigator
 from .repo_index import PythonRepoIndexer
+from .semantic_agent import SemanticWorkspaceAgent
 from .semantic_graph import SQLiteSemanticGraph
 from .workspace_actions import compile_cognitive_actions
 
@@ -58,6 +59,15 @@ def _parser() -> argparse.ArgumentParser:
     actions.add_argument("--root", default=".")
     actions.add_argument("--db")
     actions.add_argument("--limit", type=int, default=12)
+
+    agent = sub.add_parser("agent", help="run the closed-loop semantic coding/terminal agent")
+    agent.add_argument("goal")
+    agent.add_argument("--root", default=".")
+    agent.add_argument("--db")
+    agent.add_argument("--artifact", required=True)
+    agent.add_argument("--max-steps", type=int, default=12)
+    agent.add_argument("--auto-approve", action="store_true", help="approve workspace edits/process actions; use only inside an isolated benchmark/worktree")
+    agent.add_argument("--output", "-o")
     return parser
 
 
@@ -84,19 +94,29 @@ def main(argv: list[str] | None = None) -> int:
                 nodes = graph.search(args.query, limit=args.limit)
                 payload = {"matches": nodes}
                 if args.neighbors:
-                    payload["neighbors"] = {
-                        node.id: graph.neighbors(node.id, limit=20) for node in nodes[:5]
-                    }
+                    payload["neighbors"] = {node.id: graph.neighbors(node.id, limit=20) for node in nodes[:5]}
                 _print(payload)
                 return 0
+
+        if args.command == "agent":
+            # Ensure the semantic graph reflects the current worktree before the episode.
+            PythonRepoIndexer(graph, root).index()
+            episode = SemanticWorkspaceAgent.from_artifact(
+                graph, root, args.artifact, max_steps=args.max_steps
+            ).run(args.goal, auto_approve=args.auto_approve)
+            text = json.dumps(_safe(episode), indent=2, sort_keys=True, ensure_ascii=False)
+            if args.output:
+                Path(args.output).write_text(text + "\n", encoding="utf-8")
+            else:
+                print(text)
+            return 0
 
         solution = SemanticInvestigator(graph).investigate(args.goal, limit=args.limit)
         if args.command == "actions":
             _print(compile_cognitive_actions(solution))
             return 0
 
-        payload = _safe(solution)
-        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+        text = json.dumps(_safe(solution), indent=2, sort_keys=True, ensure_ascii=False)
         if args.output:
             Path(args.output).write_text(text + "\n", encoding="utf-8")
         else:
