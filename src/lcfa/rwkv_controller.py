@@ -17,6 +17,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from .protocol import SolutionState
 from .recurrent_transitions import ACTION_VOCAB
+from .torch_runtime import resolve_device, resolve_dtype
 
 
 RWKV_CONTROLLER_FORMAT = "lcfa.rwkv-controller.v1"
@@ -90,8 +91,8 @@ class RWKVRecurrentPolicy:
         model_id: str = DEFAULT_RWKV_MODEL,
         *,
         heads_path: str | Path | None = None,
-        device: str | None = None,
-        dtype: str = "bfloat16",
+        device: str | None = "auto",
+        dtype: str = "auto",
         action_names: Sequence[str] = ACTION_VOCAB,
         stop_threshold: float = 0.5,
         max_argument_tokens: int = 512,
@@ -112,21 +113,11 @@ class RWKVRecurrentPolicy:
         if "stop" not in self.action_names:
             raise RWKVControllerError("action vocabulary must contain stop")
 
-        if device is None:
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        self.device = str(device)
-        dtype_value = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }.get(str(dtype).lower())
-        if dtype_value is None:
-            raise RWKVControllerError(f"unsupported dtype: {dtype}")
+        self.device = resolve_device(torch, device)
+        try:
+            self.dtype_name, dtype_value = resolve_dtype(torch, self.device, dtype)
+        except ValueError as exc:
+            raise RWKVControllerError(str(exc)) from exc
 
         # RWKV-7 is not yet registered in every released Transformers wheel.
         # The G1j checkpoint ships its own compatible configuration/model code.
@@ -166,6 +157,8 @@ class RWKVRecurrentPolicy:
             "actions": list(self.action_names),
             "stop_threshold": self.stop_threshold,
             "loader": "transformers-remote-code",
+            "device": self.device,
+            "dtype": self.dtype_name,
         }
 
     def load_heads(self, path: str | Path) -> None:
@@ -225,7 +218,9 @@ class RWKVRecurrentPolicy:
             action_logits = self.heads["action"](self._hidden.float())
             action_probs = torch.softmax(action_logits, dim=-1)[0]
             action_index = int(torch.argmax(action_probs).item())
-            stop_probability = float(torch.sigmoid(self.heads["stop"](self._hidden.float()))[0, 0].item())
+            stop_probability = float(
+                torch.sigmoid(self.heads["stop"](self._hidden.float()))[0, 0].item()
+            )
             value = float(torch.sigmoid(self.heads["value"](self._hidden.float()))[0, 0].item())
         return RecurrentDecision(
             action=self.action_names[action_index],
@@ -255,9 +250,7 @@ class RWKVRecurrentPolicy:
         if action == "repo.read":
             path = self._candidate_path(solution)
             return {"path": path} if path else None
-        if action == "test.run":
-            return {}
-        if action in {"git.status", "git.diff"}:
+        if action in {"test.run", "verify.run", "git.status", "git.diff"}:
             return {}
         return None
 
@@ -268,7 +261,7 @@ class RWKVRecurrentPolicy:
         solution: SolutionState,
         recent: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any] | None:
-        """Use Goose's language head only to render parameters/source edits."""
+        """Use RWKV's language head only to render parameters/source edits."""
         torch = self._torch
         prompt = (
             "LCFA action argument renderer. The action has already been chosen by a recurrent policy.\n"
@@ -353,6 +346,35 @@ class RWKVRecurrentPolicy:
         })
 
 
+def load_rwkv_policy(
+    controller_dir: str | Path,
+    *,
+    model_id: str | None = None,
+    device: str | None = "auto",
+    dtype: str = "auto",
+) -> RWKVRecurrentPolicy:
+    root = Path(controller_dir)
+    manifest_path = root / "controller.json" if root.is_dir() else root
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("controller manifest must be a JSON object")
+    resolved_root = manifest_path.parent
+    weights = str(raw.get("weights") or "heads.safetensors")
+    resolved_model = str(model_id or raw.get("model_id") or "")
+    if not resolved_model:
+        raise ValueError("controller manifest requires model_id")
+    action_vocab = tuple(raw.get("action_vocab") or ())
+    if not action_vocab:
+        raise ValueError("controller manifest requires action_vocab")
+    return RWKVRecurrentPolicy(
+        resolved_model,
+        heads_path=resolved_root / weights,
+        device=device,
+        dtype=dtype,
+        action_names=action_vocab,
+    )
+
+
 __all__ = [
     "DEFAULT_RWKV_MODEL",
     "RWKV_CONTROLLER_FORMAT",
@@ -360,4 +382,5 @@ __all__ = [
     "RWKVRecurrentPolicy",
     "RecurrentDecision",
     "RecurrentPolicy",
+    "load_rwkv_policy",
 ]
