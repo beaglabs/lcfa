@@ -7,10 +7,13 @@ recurrent controller: event_t -> action_t / stop_t / value_t.
 The controller event stream intentionally excludes teacher/oracle hypotheses
 and semantic cognition snapshots. Action supervision may only depend on the
 goal plus prior actions/observations that are also available during rollout.
+Large write payloads are summarized so a complete replacement file is not
+re-tokenized on the following recurrent step.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -54,22 +57,59 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _text_summary(value: str) -> Mapping[str, Any]:
+    raw = value.encode("utf-8")
+    return {
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def compact_action(action: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Return an action representation safe to feed back into recurrent state.
+
+    Read/search/test actions retain their inputs verbatim. Write actions keep
+    their semantic target and fingerprints of the written text, but not the
+    complete source body. The source itself remains available through prior
+    ``repo.read`` observations, so this removes duplicate token work without
+    hiding repository evidence from the controller.
+    """
+    if not isinstance(action, Mapping):
+        return None
+    name = str(action.get("name") or "")
+    inputs = dict(_mapping(action.get("inputs")))
+    if name == "repo.edit" and isinstance(inputs.get("content"), str):
+        summary = _text_summary(inputs.pop("content"))
+        inputs["content_bytes"] = summary["bytes"]
+        inputs["content_sha256"] = summary["sha256"]
+    elif name == "repo.replace":
+        for key in ("old", "new"):
+            value = inputs.pop(key, None)
+            if isinstance(value, str):
+                summary = _text_summary(value)
+                inputs[f"{key}_bytes"] = summary["bytes"]
+                inputs[f"{key}_sha256"] = summary["sha256"]
+            elif value is not None:
+                inputs[key] = value
+    return {"name": name, "inputs": inputs}
+
+
 def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the rollout-available recurrent event schema.
+    """Return the rollout-available, compact recurrent event schema.
 
     Legacy v1 datasets may contain ``hypothesis`` or ``cognition`` fields.
     They are stripped at load time so old files cannot accidentally reintroduce
-    teacher information into training.
+    teacher information into training. Large write payloads are fingerprinted
+    identically during dataset preparation and live rollout.
     """
     kind = str(event.get("kind") or "")
     if kind == "goal":
         return {"kind": "goal", "goal": str(event.get("goal") or "")}
     if kind == "transition":
-        action = event.get("action")
         observation = event.get("observation")
         return {
             "kind": "transition",
-            "action": dict(action) if isinstance(action, Mapping) else None,
+            "action": compact_action(event.get("action") if isinstance(event.get("action"), Mapping) else None),
             "observation": (
                 dict(observation) if isinstance(observation, Mapping) else {}
             ),
@@ -125,11 +165,11 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
         if position == 1:
             event: Mapping[str, Any] = {"kind": "goal", "goal": goal}
         else:
-            event = {
+            event = normalize_event({
                 "kind": "transition",
                 "action": dict(previous_action) if previous_action else None,
                 "observation": dict(previous_observation),
-            }
+            })
 
         out.append(
             RecurrentTransition(
@@ -227,6 +267,7 @@ __all__ = [
     "LEGACY_RECURRENT_TRANSITION_FORMAT",
     "RECURRENT_TRANSITION_FORMAT",
     "RecurrentTransition",
+    "compact_action",
     "dump_transitions",
     "episode_to_transitions",
     "load_episode",

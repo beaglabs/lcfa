@@ -126,6 +126,95 @@ def _collection_progress(event: Mapping[str, Any]) -> None:
     )
 
 
+def _training_progress(event: Mapping[str, Any]) -> None:
+    kind = str(event.get("event") or "")
+    if kind == "model-load-start":
+        print(
+            "[lcfa] train load-model "
+            f"device={event.get('device')} dtype={event.get('dtype')} "
+            f"train={event.get('train_transitions')} validation={event.get('validation_transitions')} "
+            f"epochs={event.get('epochs')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "model-loaded":
+        print(
+            f"[lcfa] train model-loaded elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "feature-cache-start":
+        print(
+            "[lcfa] train cache-features "
+            f"episodes={event.get('episodes')} transitions={event.get('transitions')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "feature-cache-progress":
+        print(
+            "[lcfa] train cache-features "
+            f"episode={event.get('episode')}/{event.get('episodes')} "
+            f"transitions={event.get('transitions')}/{event.get('total_transitions')} "
+            f"tokens={event.get('tokens')} max_event_tokens={event.get('max_event_tokens')} "
+            f"elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "feature-cache-done":
+        print(
+            "[lcfa] train features-ready "
+            f"tokens={event.get('tokens')} max_event_tokens={event.get('max_event_tokens')} "
+            f"elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "epoch-done":
+        print(
+            "[lcfa] train "
+            f"epoch={event.get('epoch')}/{event.get('epochs')} "
+            f"loss={float(event.get('loss', 0.0)):.6f} "
+            f"action_acc={float(event.get('action_accuracy', 0.0)):.3f} "
+            f"stop_acc={float(event.get('stop_accuracy', 0.0)):.3f} "
+            f"elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "evaluation-start":
+        print(
+            "[lcfa] train final-evaluation "
+            f"train={event.get('train_transitions')} validation={event.get('validation_transitions')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "evaluation-done":
+        validation = event.get("validation_action_accuracy")
+        validation_text = "n/a" if validation is None else f"{float(validation):.3f}"
+        print(
+            "[lcfa] train evaluation-done "
+            f"train_action_acc={float(event.get('train_action_accuracy', 0.0)):.3f} "
+            f"validation_action_acc={validation_text} "
+            f"elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if kind == "training-done":
+        print(
+            "[lcfa] train done "
+            f"updates={event.get('updates')} elapsed={float(event.get('elapsed_seconds', 0.0)):.1f}s "
+            f"output={event.get('output')}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -187,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         dtype=args.dtype,
         validation_fraction=args.validation_fraction,
         seed=args.seed,
+        progress=_training_progress,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
