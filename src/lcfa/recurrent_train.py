@@ -83,8 +83,12 @@ def train_rwkv_heads(
     resolved_device = _device(torch, device)
     resolved_dtype = _dtype(torch, dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=resolved_dtype).to(resolved_device)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=resolved_dtype,
+        trust_remote_code=True,
+    ).to(resolved_device)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -193,6 +197,7 @@ def train_rwkv_heads(
         "weights": "heads.safetensors",
         "backbone_frozen": True,
         "state_api": "rwkv7.state",
+        "loader": "transformers-remote-code",
         "seed": seed,
     }
     (output / "controller.json").write_text(
