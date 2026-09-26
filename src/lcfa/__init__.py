@@ -12,9 +12,12 @@ from .operator_lib import ConstraintViolation, register_reasoning_operators
 from .operators import register_core_operators
 from .profile import Profile, ProfileError, load_profile
 from .protocol import ActionGraph, ActionNode, ActionResult, ActionRun, EntityRef, EvidenceRef, EvidenceValue, ExecutionContext, Finding, OperatorResult, PlanNode, ReasoningPlan, Recommendation, SolutionState
+from .recurrent_transitions import ACTION_VOCAB, RECURRENT_TRANSITION_FORMAT, RecurrentTransition, dump_transitions, episode_to_transitions, load_episode, load_transitions, prepare_transition_file
 from .registry import ActionRegistry, ActionSpec, OperatorRegistry, OperatorSpec
 from .repo_index import IndexResult, PythonRepoIndexer
 from .runtime import ActionExecutor, ActionPolicyError, PlanError, ReasoningExecutor
+from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError, RWKVRecurrentPolicy, RecurrentDecision, RecurrentPolicy
+from .rwkv_semantic import RWKVSemanticBackbone, load_rwkv_semantic_backbone
 from .semantic_agent import SEMANTIC_AGENT_TRAJECTORY_FORMAT, SemanticAgentEpisode, SemanticAgentStep, SemanticWorkspaceAgent
 from .semantic_graph import SEMANTIC_GRAPH_FORMAT, ConceptEdge, ConceptNode, ConceptSnapshot, ContentRef, SemanticGraph, SQLiteSemanticGraph
 from .serde import IR_FORMAT, SerializationError, dump_ir, dumps_ir, from_ir_dict, load_ir, loads_ir, to_ir_dict
