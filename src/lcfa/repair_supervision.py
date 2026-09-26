@@ -1,8 +1,13 @@
 """Historical repair targets used only for supervised edit/correction labels.
 
-Gold commits are intentionally isolated here.  Repository localization never
+Gold commits are intentionally isolated here. Repository localization never
 calls this module; fix refs are used only after base-repository retrieval has
 chosen what the agent can observe.
+
+Documentation-only changes are excluded by default. LCFA recurrent repair
+training is evaluated by executable verifiers, so requiring README/docs edits
+to appear in the localizer's top-k produces false localization failures and
+teaches the controller to spend repair capacity on non-executable artifacts.
 """
 from __future__ import annotations
 
@@ -27,6 +32,38 @@ class RepairTarget:
 
     def to_dict(self) -> Mapping[str, Any]:
         return asdict(self)
+
+
+_DOCUMENTATION_SUFFIXES = {".md", ".markdown", ".rst", ".adoc"}
+_DOCUMENTATION_DIRS = {"doc", "docs", "documentation"}
+_DOCUMENTATION_STEMS = {
+    "readme",
+    "changelog",
+    "changes",
+    "contributing",
+    "contributors",
+    "license",
+    "notice",
+}
+
+
+def is_documentation_path(path: str) -> bool:
+    """Return True for files that should not be executable repair targets.
+
+    This is deliberately conservative: configuration, tests, requirements and
+    other text files remain eligible. Only obvious documentation surfaces are
+    filtered from the default coding-policy supervision set.
+    """
+    normalized = str(path).replace("\\", "/").strip("/")
+    candidate = Path(normalized)
+    parts = tuple(part.casefold() for part in candidate.parts)
+    if parts and parts[0] in _DOCUMENTATION_DIRS:
+        return True
+    if candidate.suffix.casefold() in _DOCUMENTATION_SUFFIXES:
+        return True
+    if candidate.stem.casefold() in _DOCUMENTATION_STEMS:
+        return True
+    return False
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -103,7 +140,16 @@ def historical_repair_targets(
     repo: str | Path,
     base_ref: str,
     fix_ref: str,
+    *,
+    include_documentation: bool = False,
 ) -> tuple[RepairTarget, ...]:
+    """Build span/file repair labels from a known passing historical fix.
+
+    The fix commit supplies edit labels only. By default documentation-only
+    files are excluded so localization and edit supervision remain focused on
+    files that can affect the executable verifier. Set ``include_documentation``
+    only for explicit documentation benchmarks.
+    """
     root = Path(repo).expanduser().resolve()
     status = _git(root, "diff", "--name-status", base_ref, fix_ref, "--").decode(
         "utf-8", errors="replace"
@@ -120,6 +166,8 @@ def historical_repair_targets(
                 f"unsupported diff entry: {line}"
             )
         path = parts[1]
+        if not include_documentation and is_documentation_path(path):
+            continue
         before = _text(root, base_ref, path, missing_ok=(change == "A"))
         after = _text(root, fix_ref, path)
         span = _minimal_span(before, after)
@@ -138,7 +186,9 @@ def historical_repair_targets(
             after_sha256=_hash(after),
         ))
     if not targets:
-        raise RepairSupervisionError("fix ref contains no supported text repair targets")
+        raise RepairSupervisionError(
+            "fix ref contains no supported executable repair targets"
+        )
     return tuple(targets)
 
 
@@ -146,4 +196,5 @@ __all__ = [
     "RepairSupervisionError",
     "RepairTarget",
     "historical_repair_targets",
+    "is_documentation_path",
 ]
