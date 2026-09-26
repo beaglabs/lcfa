@@ -171,7 +171,15 @@ def dump_transitions(rows: Iterable[RecurrentTransition], path: str | Path) -> i
 
 def prepare_transition_file(episodes: Sequence[str | Path], output: str | Path) -> int:
     rows: list[RecurrentTransition] = []
-    for path in episodes:
+    for raw_path in episodes:
+        path = Path(raw_path)
+        if path.is_dir():
+            for child in sorted(path.glob("*.json")):
+                episode = load_episode(child)
+                if str(episode.get("schema_version", "")) != "lcfa.semantic-trajectory.v1":
+                    continue
+                rows.extend(episode_to_transitions(episode))
+            continue
         rows.extend(episode_to_transitions(load_episode(path)))
     return dump_transitions(rows, output)
 
