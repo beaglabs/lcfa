@@ -2,8 +2,8 @@
 
 The semantic agent keeps a structured compatibility envelope while every
 action-type decision comes from RWKV recurrent state. Retrieval-backed search,
-read, and edit paths are resolved against the same ranked candidates present in
-the training event stream.
+read, and edit paths resolve against the same ranked candidates present in the
+training event stream.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from .backbones import BackboneSample
 from .protocol import SolutionState
-from .repo_retrieval import build_retrieval_context
+from .repo_retrieval import build_retrieval_context, extract_retrieval_queries
 from .rwkv_controller import RWKVRecurrentPolicy, load_rwkv_policy
 from .semantic_graph import SQLiteSemanticGraph
 
@@ -46,11 +46,45 @@ class RWKVSemanticBackbone:
             return ()
         return tuple(str(item) for item in raw if str(item))
 
+    @staticmethod
+    def _valid_path(value: Any) -> str | None:
+        rendered = str(value or "").strip()
+        if not rendered or rendered in {".", "/"} or Path(rendered).is_absolute():
+            return None
+        return rendered
+
+    def _paths_from_locations(self, cognition: Mapping[str, Any]) -> tuple[str, ...]:
+        paths: list[str] = []
+        for concept_id in self._sequence(cognition, "candidate_locations"):
+            try:
+                node = self.graph.get_node(concept_id)
+            except (KeyError, AttributeError):
+                continue
+            path = self._valid_path(node.metadata.get("path"))
+            if path and path not in paths:
+                paths.append(path)
+        return tuple(paths)
+
     def _ensure_retrieval(self, goal: str, cognition: Mapping[str, Any]) -> Mapping[str, Any]:
         updated = dict(cognition)
-        if self._sequence(updated, "candidate_queries") and self._sequence(updated, "candidate_paths"):
+        queries = self._sequence(updated, "candidate_queries")
+        paths = self._sequence(updated, "candidate_paths")
+        if queries and paths:
             return updated
-        retrieval = build_retrieval_context(self.graph, goal)
+        location_paths = self._paths_from_locations(updated)
+        if location_paths:
+            updated["candidate_paths"] = list(location_paths)
+            if not queries:
+                extracted = extract_retrieval_queries(goal)
+                updated["candidate_queries"] = list(extracted or (goal,))
+            return updated
+        try:
+            retrieval = build_retrieval_context(self.graph, goal)
+        except (AttributeError, TypeError):
+            extracted = extract_retrieval_queries(goal)
+            updated["candidate_queries"] = list(extracted or (goal,))
+            updated.setdefault("candidate_paths", [])
+            return updated
         updated["candidate_queries"] = list(retrieval.queries)
         updated["candidate_paths"] = list(retrieval.candidate_paths)
         updated["candidate_locations"] = list(retrieval.candidate_ids)
@@ -59,37 +93,29 @@ class RWKVSemanticBackbone:
     def _candidate_path(
         self,
         cognition: Mapping[str, Any],
-        pointer: int | None,
+        pointer: int | None = None,
         *,
         prefer_unread: bool = False,
     ) -> str | None:
-        paths = self._sequence(cognition, "candidate_paths")
-        if paths:
-            start = int(pointer or 0) % len(paths)
-            ordered = [paths[(start + offset) % len(paths)] for offset in range(len(paths))]
-            if prefer_unread:
-                for path in ordered:
-                    if path not in self._read_paths:
-                        return path
-            return ordered[0]
-        raw = cognition.get("candidate_locations", ())
-        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        paths = tuple(
+            path
+            for path in (
+                self._valid_path(item)
+                for item in self._sequence(cognition, "candidate_paths")
+            )
+            if path
+        )
+        if not paths:
+            paths = self._paths_from_locations(cognition)
+        if not paths:
             return None
-        for concept_id in raw:
-            try:
-                node = self.graph.get_node(str(concept_id))
-            except KeyError:
-                continue
-            path = node.metadata.get("path")
-            if not path:
-                continue
-            rendered = str(path).strip()
-            if not rendered or rendered in {".", "/"} or Path(rendered).is_absolute():
-                continue
-            if prefer_unread and rendered in self._read_paths:
-                continue
-            return rendered
-        return None
+        start = int(pointer or 0) % len(paths)
+        ordered = [paths[(start + offset) % len(paths)] for offset in range(len(paths))]
+        if prefer_unread:
+            for path in ordered:
+                if path not in self._read_paths:
+                    return path
+        return ordered[0]
 
     def _candidate_query(self, cognition: Mapping[str, Any], pointer: int | None) -> str | None:
         queries = self._sequence(cognition, "candidate_queries")
@@ -109,7 +135,9 @@ class RWKVSemanticBackbone:
         if observation_id and observation_id == self._last_observation_id:
             return
         self.policy.observe(self._last_action, latest, solution)
-        self._last_observation_id = observation_id or json.dumps(latest, sort_keys=True, default=str)
+        self._last_observation_id = observation_id or json.dumps(
+            latest, sort_keys=True, default=str
+        )
 
     def sample(
         self,
@@ -133,9 +161,7 @@ class RWKVSemanticBackbone:
             raise ValueError("semantic RWKV prompt must be an object")
         goal = str(payload.get("goal") or "")
         cognition_raw = payload.get("cognition", {})
-        cognition = (
-            dict(cognition_raw) if isinstance(cognition_raw, Mapping) else {}
-        )
+        cognition = dict(cognition_raw) if isinstance(cognition_raw, Mapping) else {}
         cognition = dict(self._ensure_retrieval(goal, cognition))
         recent = payload.get("recent_observations", ())
         if not isinstance(recent, Sequence) or isinstance(recent, (str, bytes)):
@@ -163,7 +189,13 @@ class RWKVSemanticBackbone:
 
         if action is not None:
             name = str(action.get("name") or "")
-            inputs = dict(action.get("inputs", {})) if isinstance(action.get("inputs"), Mapping) else {}
+            inputs = (
+                dict(action.get("inputs", {}))
+                if isinstance(action.get("inputs"), Mapping)
+                else {}
+            )
+            if controller.get("fallback_from") == "repo.read":
+                name = "repo.read"
             if name == "repo.search":
                 query = self._candidate_query(cognition, pointer)
                 if query:
@@ -192,7 +224,9 @@ class RWKVSemanticBackbone:
 
         self._last_action = dict(action) if isinstance(action, Mapping) else None
         text = json.dumps(choice, sort_keys=True, ensure_ascii=False)
-        return tuple(BackboneSample(text, 0.0) for _ in range(max(1, int(branches))))
+        return tuple(
+            BackboneSample(text, 0.0) for _ in range(max(1, int(branches)))
+        )
 
 
 def load_rwkv_semantic_backbone(
