@@ -20,6 +20,7 @@ ACTION_VOCAB: tuple[str, ...] = (
     "repo.replace",
     "repo.edit",
     "test.run",
+    "verify.run",
     "git.status",
     "git.diff",
     "process.exec",
@@ -151,7 +152,9 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
                     event=dict(_mapping(raw.get("event"))),
                     target_action=str(raw["target_action"]),
                     stop_target=bool(raw["stop_target"]),
-                    value_target=(None if raw.get("value_target") is None else float(raw["value_target"])),
+                    value_target=(
+                        None if raw.get("value_target") is None else float(raw["value_target"])
+                    ),
                     metadata=dict(_mapping(raw.get("metadata"))),
                 )
             )
