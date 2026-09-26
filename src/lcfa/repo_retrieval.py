@@ -2,12 +2,13 @@
 
 The same deterministic retrieval contract is used by historical-oracle
 collection, live semantic investigation, and recurrent action argument
-resolution.  This prevents the controller from being trained on gold-informed
+resolution. This prevents the controller from being trained on gold-informed
 paths while seeing a different localization mechanism at inference time.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 
@@ -107,6 +108,55 @@ def _exact_score(node: ConceptNode, query: str) -> float:
     return 2.0
 
 
+def _lexical_terms(text: str) -> set[str]:
+    return {
+        item.casefold()
+        for item in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}", text.replace("-", "_"))
+        if item.casefold() not in _STOP
+    }
+
+
+def _path_boost(path: str, queries: Sequence[str], goal: str) -> tuple[float, tuple[str, ...]]:
+    """Score filename/path evidence independently of symbol-frequency evidence.
+
+    Repositories often contain many references to an identifier, which can
+    swamp the file that is explicitly named by the issue (for example an issue
+    about the RWKV controller should strongly favor ``rwkv_controller.py``).
+    Path evidence is deterministic and uses only the base repository.
+    """
+    rendered = str(PurePosixPath(path)).casefold()
+    stem = PurePosixPath(path).stem.casefold()
+    path_terms = _lexical_terms(rendered)
+    goal_terms = _lexical_terms(goal)
+    score = 0.0
+    evidence: list[str] = []
+
+    overlap = path_terms & goal_terms
+    if overlap:
+        score += 3.0 * len(overlap)
+        evidence.append("path-goal:" + ",".join(sorted(overlap)))
+
+    for rank, query in enumerate(queries):
+        q = query.casefold()
+        query_terms = _lexical_terms(query)
+        rank_weight = max(1.0, 5.0 - rank * 0.5)
+        if q and q in rendered:
+            score += 4.0 * rank_weight
+            evidence.append(f"path-exact:{query}")
+            continue
+        token_overlap = query_terms & path_terms
+        if token_overlap:
+            score += 1.5 * rank_weight * len(token_overlap)
+            evidence.append(
+                f"path-token:{query}:" + ",".join(sorted(token_overlap))
+            )
+        if q and q.replace("-", "_") == stem:
+            score += 6.0 * rank_weight
+            evidence.append(f"stem-exact:{query}")
+
+    return score, tuple(evidence)
+
+
 def build_retrieval_context(
     graph: SQLiteSemanticGraph,
     goal: str,
@@ -114,9 +164,9 @@ def build_retrieval_context(
     query_limit: int = MAX_RETRIEVAL_QUERIES,
     candidate_limit: int = MAX_RETRIEVAL_CANDIDATES,
 ) -> RetrievalContext:
-    """Fuse exact identifier lookup, lexical graph search, and AST relations.
+    """Fuse exact identifier lookup, lexical graph search, AST relations and path evidence.
 
-    Scores are deterministic and only use the indexed base repository.  No
+    Scores are deterministic and only use the indexed base repository. No
     historical fix path or gold patch information is accepted by this API.
     """
     queries = extract_retrieval_queries(goal, limit=query_limit)
@@ -139,7 +189,6 @@ def build_retrieval_context(
 
     for rank, query in enumerate(queries):
         query_weight = max(1.0, 4.0 - rank * 0.35)
-        # Exact identifier nodes are indexed by the Python AST visitor.
         exact_ids = (
             f"identifier://python/{query}",
             f"callable://python/{query}",
@@ -156,7 +205,6 @@ def build_retrieval_context(
                 except KeyError:
                     continue
                 add(other, 10.0 * query_weight, f"exact:{query}:{edge.relation}")
-                # AST occurrence -> owning symbol/file expansion.
                 for edge2 in graph.neighbors(other.id, direction="both", limit=16):
                     related_id = edge2.target if edge2.source == other.id else edge2.source
                     try:
@@ -171,8 +219,6 @@ def build_retrieval_context(
                 _exact_score(node, query) * query_weight,
                 f"lexical:{query}",
             )
-            # A matching symbol can point to its containing module/file or
-            # identifiers/calls that provide structural evidence.
             for edge in graph.neighbors(node.id, direction="both", limit=12):
                 other_id = edge.target if edge.source == node.id else edge.source
                 try:
@@ -181,27 +227,24 @@ def build_retrieval_context(
                     continue
                 add(other, 1.5 * query_weight, f"neighbor:{query}:{edge.relation}")
 
-    # Fall back to the old whole-goal lexical graph search only when specific
-    # identifiers yielded no path-bearing candidates.
     if not scores:
         for node in graph.search(goal, limit=max(32, candidate_limit * 2)):
             add(node, 1.0, "goal-lexical")
 
-    # Aggregate multiple symbol/AST hits onto one path while preserving the
-    # strongest concept as the pointer target.
     by_path: dict[str, RetrievalCandidate] = {}
     for node_id, score in scores.items():
         node = nodes[node_id]
         path = _path(node)
         if not path:
             continue
+        boost, boost_evidence = _path_boost(path, queries, goal)
         candidate = RetrievalCandidate(
             concept_id=node.id,
             path=path,
             kind=node.kind,
             label=node.label,
-            score=score,
-            evidence=tuple(evidence.get(node.id, ())),
+            score=score + boost,
+            evidence=tuple(dict.fromkeys([*evidence.get(node.id, ()), *boost_evidence])),
         )
         previous = by_path.get(path)
         if previous is None:
