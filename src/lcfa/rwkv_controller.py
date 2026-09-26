@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from .protocol import SolutionState
-from .recurrent_transitions import ACTION_VOCAB
+from .recurrent_transitions import ACTION_VOCAB, normalize_event
 from .torch_runtime import resolve_device, resolve_dtype
 
 
@@ -157,7 +157,7 @@ class RWKVRecurrentPolicy:
             "loader": "transformers-remote-code",
             "device": self.device,
             "dtype": self.dtype_name,
-            "event_schema": "goal + prior action/observation only",
+            "event_schema": "goal + compact prior action/observation",
         }
 
     def load_heads(self, path: str | Path) -> None:
@@ -178,6 +178,7 @@ class RWKVRecurrentPolicy:
 
     def _forward_event(self, payload: Mapping[str, Any]) -> None:
         torch = self._torch
+        payload = normalize_event(payload)
         text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         kwargs: dict[str, Any] = {
