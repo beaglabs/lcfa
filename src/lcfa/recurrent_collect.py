@@ -268,8 +268,20 @@ def _add_worktree(source_repo: Path, worktree: Path, ref: str) -> str:
     if worktree.exists():
         shutil.rmtree(worktree)
     worktree.parent.mkdir(parents=True, exist_ok=True)
+    # /tmp may be removed independently of Git's administrative worktree entry.
+    # Prune those stale registrations before recreating the collector-owned path.
+    _git(source_repo, "worktree", "prune", timeout=30)
     resolved = _git(source_repo, "rev-parse", ref)
-    _git(source_repo, "worktree", "add", "--detach", str(worktree), resolved, timeout=120)
+    _git(
+        source_repo,
+        "worktree",
+        "add",
+        "--force",
+        "--detach",
+        str(worktree),
+        resolved,
+        timeout=120,
+    )
     return resolved
 
 
