@@ -1,10 +1,10 @@
 """Training for LCFA recurrent RWKV controllers.
 
 Fast ``frozen`` mode caches RWKV recurrent features and trains action, pointer,
-stop, and value heads. ``full`` mode updates RWKV itself from the same
-closed-loop event schema and adds causal-LM supervision for repo.replace/edit
-arguments, allowing verifier-derived corrective trajectories to improve both
-control and source-edit rendering.
+stop, and value heads. ``full`` mode updates RWKV itself from whole recurrent
+episodes and adds causal-LM supervision for repo.replace/edit arguments.
+Controllers can initialize from a prior controller so iterative improvement is
+cumulative in both data and weights.
 """
 from __future__ import annotations
 
@@ -37,24 +37,14 @@ ProgressCallback = Callable[[Mapping[str, Any]], None]
 
 
 def _event_text(row: RecurrentTransition) -> str:
-    return json.dumps(row.event, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return json.dumps(
+        row.event, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ) + "\n"
 
 
 def _emit(progress: ProgressCallback | None, event: str, **values: Any) -> None:
     if progress is not None:
         progress({"event": event, **values})
-
-
-def _detach_state(value: Any) -> Any:
-    if hasattr(value, "detach"):
-        return value.detach()
-    if isinstance(value, tuple):
-        return tuple(_detach_state(item) for item in value)
-    if isinstance(value, list):
-        return [_detach_state(item) for item in value]
-    if isinstance(value, Mapping):
-        return {key: _detach_state(item) for key, item in value.items()}
-    return value
 
 
 def _make_heads(torch: Any, hidden_size: int, pointer_slots: int, device: str) -> Any:
@@ -66,6 +56,70 @@ def _make_heads(torch: Any, hidden_size: int, pointer_slots: int, device: str) -
     if pointer_slots > 0:
         modules["pointer"] = torch.nn.Linear(hidden_size, pointer_slots)
     return torch.nn.ModuleDict(modules).to(device)
+
+
+def _load_initial_controller(
+    init_controller: str | Path | None,
+    *,
+    model: Any,
+    heads: Any,
+    model_id: str,
+    device: str,
+) -> Mapping[str, Any]:
+    """Reuse compatible controller/backbone weights for cumulative training."""
+    if init_controller is None:
+        return {
+            "controller": None,
+            "head_tensors_loaded": 0,
+            "backbone_loaded": False,
+        }
+    try:
+        from safetensors.torch import load_file, load_model
+    except ImportError as exc:
+        raise RWKVControllerError("safetensors torch support is required") from exc
+
+    root = Path(init_controller).expanduser().resolve()
+    manifest_path = root / "controller.json" if root.is_dir() else root
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise ValueError("initial controller manifest must be a JSON object")
+    previous_model = str(manifest.get("model_id") or "")
+    if previous_model and previous_model != str(model_id):
+        raise ValueError(
+            f"initial controller model mismatch: {previous_model} != {model_id}"
+        )
+    root = manifest_path.parent
+
+    backbone_loaded = False
+    backbone_weights = manifest.get("backbone_weights")
+    if backbone_weights:
+        missing, unexpected = load_model(
+            model,
+            str(root / str(backbone_weights)),
+            strict=False,
+            device=device,
+        )
+        if missing or unexpected:
+            raise RWKVControllerError(
+                "initial backbone tensor mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
+        backbone_loaded = True
+
+    weights_path = root / str(manifest.get("weights") or "heads.safetensors")
+    loaded = load_file(str(weights_path), device=device)
+    current = heads.state_dict()
+    compatible: dict[str, Any] = {}
+    for key, tensor in loaded.items():
+        if key in current and tuple(tensor.shape) == tuple(current[key].shape):
+            compatible[key] = tensor
+    current.update(compatible)
+    heads.load_state_dict(current, strict=True)
+    return {
+        "controller": str(manifest_path),
+        "head_tensors_loaded": len(compatible),
+        "backbone_loaded": backbone_loaded,
+    }
 
 
 def _control_loss(
@@ -99,7 +153,6 @@ def _control_loss(
             value_logit.float(), target_value
         )
 
-    pointer_logits = None
     pointer_correct = None
     if (
         row.target_pointer is not None
@@ -159,11 +212,7 @@ def _argument_loss(
     if target_ids.shape[-1] == 0:
         return None
     input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
-    outputs = model(
-        input_ids=input_ids,
-        use_cache=False,
-        return_dict=True,
-    )
+    outputs = model(input_ids=input_ids, use_cache=False, return_dict=True)
     logits = outputs.logits[:, :-1, :].float()
     labels = input_ids[:, 1:].clone()
     prompt_length = int(prompt_ids.shape[-1])
@@ -173,6 +222,63 @@ def _argument_loss(
         logits.reshape(-1, logits.shape[-1]),
         labels.reshape(-1),
         ignore_index=-100,
+    )
+
+
+def _full_episode_hidden_states(
+    model: Any,
+    tokenizer: Any,
+    episode: Sequence[RecurrentTransition],
+    *,
+    device: str,
+) -> tuple[list[tuple[RecurrentTransition, Any]], int, int]:
+    """Forward one complete recurrent episode and return each event boundary.
+
+    Using one differentiable forward avoids carrying/detaching model-specific
+    RWKV cache objects across optimizer steps. Prefix tokenization determines
+    the exact hidden-state position after each serialized recurrent event.
+    """
+    if not episode:
+        return [], 0, 0
+    texts = [_event_text(row) for row in episode]
+    full_text = "".join(texts)
+    encoded = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded["input_ids"].to(device)
+    token_count = int(input_ids.shape[-1])
+    if token_count <= 0:
+        raise RWKVControllerError("recurrent episode tokenized to an empty sequence")
+
+    boundaries: list[int] = []
+    prefix = ""
+    for text in texts:
+        prefix += text
+        prefix_ids = tokenizer(
+            prefix, return_tensors="pt", add_special_tokens=False
+        )["input_ids"]
+        boundary = int(prefix_ids.shape[-1]) - 1
+        if boundary < 0 or boundary >= token_count:
+            raise RWKVControllerError(
+                f"invalid recurrent event boundary {boundary} for {token_count} tokens"
+            )
+        boundaries.append(boundary)
+
+    outputs = model(
+        input_ids=input_ids,
+        use_cache=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if not hidden_states:
+        raise RWKVControllerError("RWKV forward must return hidden_states")
+    sequence_hidden = hidden_states[-1].float()
+    return (
+        [
+            (row, sequence_hidden[:, boundary, :])
+            for row, boundary in zip(episode, boundaries)
+        ],
+        token_count,
+        max(boundary + 1 for boundary in boundaries),
     )
 
 
@@ -192,6 +298,7 @@ def train_rwkv_heads(
     pointer_loss_weight: float = 0.5,
     argument_loss_weight: float = 0.25,
     max_argument_chars: int = 8192,
+    init_controller: str | Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> Mapping[str, Any]:
     try:
@@ -256,6 +363,7 @@ def train_rwkv_heads(
         epochs=epoch_count,
         backbone_mode=resolved_backbone_mode,
         pointer_slots=pointer_slots,
+        init_controller=str(init_controller) if init_controller else None,
     )
     load_started = time.monotonic()
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -268,12 +376,24 @@ def train_rwkv_heads(
     if hidden_size <= 0:
         raise RWKVControllerError("RWKV model config does not expose hidden_size")
     heads = _make_heads(torch, hidden_size, pointer_slots, resolved_device)
+    initialization = _load_initial_controller(
+        init_controller,
+        model=model,
+        heads=heads,
+        model_id=model_id,
+        device=resolved_device,
+    )
     action_index = {name: index for index, name in enumerate(ACTION_VOCAB)}
 
     frozen = resolved_backbone_mode == "frozen"
     model.eval() if frozen else model.train()
     for parameter in model.parameters():
         parameter.requires_grad_(not frozen)
+    if not frozen and hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
     heads.train()
     _emit(
         progress,
@@ -282,11 +402,12 @@ def train_rwkv_heads(
         device=resolved_device,
         dtype=resolved_dtype_name,
         backbone_mode=resolved_backbone_mode,
+        initialization=dict(initialization),
     )
 
     cached_episodes: list[list[tuple[RecurrentTransition, Any]]] = []
-    cached_tokens = 0
-    max_event_tokens = 0
+    processed_tokens = 0
+    max_sequence_tokens = 0
     cached_train: list[list[tuple[RecurrentTransition, Any]]] = []
     cached_validation: list[list[tuple[RecurrentTransition, Any]]] = []
 
@@ -308,8 +429,8 @@ def train_rwkv_heads(
                 )
                 input_ids = encoded["input_ids"].to(resolved_device)
                 token_count = int(input_ids.shape[-1])
-                cached_tokens += token_count
-                max_event_tokens = max(max_event_tokens, token_count)
+                processed_tokens += token_count
+                max_sequence_tokens = max(max_sequence_tokens, token_count)
                 kwargs: dict[str, Any] = {
                     "input_ids": input_ids,
                     "use_cache": True,
@@ -337,16 +458,16 @@ def train_rwkv_heads(
                 episodes=len(all_episode_groups),
                 transitions=cached_transitions,
                 total_transitions=len(rows),
-                tokens=cached_tokens,
-                max_event_tokens=max_event_tokens,
+                tokens=processed_tokens,
+                max_event_tokens=max_sequence_tokens,
                 elapsed_seconds=time.monotonic() - feature_started,
             )
         _emit(
             progress,
             "feature-cache-done",
             transitions=cached_transitions,
-            tokens=cached_tokens,
-            max_event_tokens=max_event_tokens,
+            tokens=processed_tokens,
+            max_event_tokens=max_sequence_tokens,
             elapsed_seconds=time.monotonic() - feature_started,
         )
         cached_train = [
@@ -362,7 +483,10 @@ def train_rwkv_heads(
         optimizer = torch.optim.AdamW(
             [
                 {"params": list(heads.parameters()), "lr": float(learning_rate)},
-                {"params": list(model.parameters()), "lr": float(backbone_learning_rate)},
+                {
+                    "params": [p for p in model.parameters() if p.requires_grad],
+                    "lr": float(backbone_learning_rate),
+                },
             ]
         )
 
@@ -380,7 +504,9 @@ def train_rwkv_heads(
         epoch_loss = 0.0
         epoch_updates = 0
         epoch_action_correct = 0
+        epoch_action_total = 0
         epoch_stop_correct = 0
+        epoch_stop_total = 0
         epoch_pointer_correct = 0
         epoch_pointer_total = 0
         epoch_argument_examples = 0
@@ -394,97 +520,120 @@ def train_rwkv_heads(
 
         if frozen:
             random.shuffle(cached_train)
-            iterable: Sequence[Any] = cached_train
-        else:
-            train_groups = [
-                list(episode) for episode in group_episodes(train_rows)
-            ]
-            random.shuffle(train_groups)
-            iterable = train_groups
-
-        for episode in iterable:
-            state: Any = None
-            for item in episode:
-                if frozen:
-                    row, hidden = item
-                else:
-                    row = item
-                    encoded = tokenizer(
-                        _event_text(row), return_tensors="pt", add_special_tokens=False
-                    )
-                    input_ids = encoded["input_ids"].to(resolved_device)
-                    token_count = int(input_ids.shape[-1])
-                    cached_tokens += token_count
-                    max_event_tokens = max(max_event_tokens, token_count)
-                    kwargs: dict[str, Any] = {
-                        "input_ids": input_ids,
-                        "use_cache": True,
-                        "output_hidden_states": True,
-                        "return_dict": True,
-                    }
-                    if state is not None:
-                        kwargs["state"] = _detach_state(state)
-                    outputs = model(**kwargs)
-                    hidden_states = getattr(outputs, "hidden_states", None)
-                    state = getattr(outputs, "state", None)
-                    if not hidden_states or state is None:
-                        raise RWKVControllerError(
-                            "RWKV forward must return hidden_states and recurrent state"
-                        )
-                    hidden = hidden_states[-1][:, -1, :].float()
-
-                loss, accuracy = _control_loss(
-                    torch,
-                    row,
-                    hidden,
-                    heads=heads,
-                    action_index=action_index,
-                    device=resolved_device,
-                    pointer_loss_weight=pointer_loss_weight,
-                )
-                if not frozen and float(argument_loss_weight) > 0:
-                    arg_loss = _argument_loss(
+            for episode in cached_train:
+                for row, hidden in episode:
+                    loss, accuracy = _control_loss(
                         torch,
-                        model,
-                        tokenizer,
                         row,
+                        hidden,
+                        heads=heads,
+                        action_index=action_index,
                         device=resolved_device,
-                        max_argument_chars=max_argument_chars,
+                        pointer_loss_weight=pointer_loss_weight,
                     )
-                    if arg_loss is not None:
-                        loss = loss + float(argument_loss_weight) * arg_loss
-                        epoch_argument_examples += 1
-                        argument_examples += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(heads.parameters(), 1.0)
+                    optimizer.step()
 
+                    total_updates += 1
+                    epoch_updates += 1
+                    last_loss = float(loss.detach().cpu().item())
+                    epoch_loss += last_loss
+                    epoch_action_correct += int(accuracy["action_correct"])
+                    epoch_action_total += 1
+                    epoch_stop_correct += int(accuracy["stop_correct"])
+                    epoch_stop_total += 1
+                    optimization_action_correct += int(accuracy["action_correct"])
+                    optimization_action_total += 1
+                    optimization_stop_correct += int(accuracy["stop_correct"])
+                    optimization_stop_total += 1
+                    if accuracy["pointer_correct"] is not None:
+                        epoch_pointer_correct += int(accuracy["pointer_correct"])
+                        epoch_pointer_total += 1
+                        optimization_pointer_correct += int(accuracy["pointer_correct"])
+                        optimization_pointer_total += 1
+        else:
+            train_groups = [list(episode) for episode in group_episodes(train_rows)]
+            random.shuffle(train_groups)
+            for episode in train_groups:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                parameters = list(heads.parameters())
-                if not frozen:
-                    parameters.extend(parameter for parameter in model.parameters() if parameter.requires_grad)
+                row_hiddens, episode_tokens, episode_max = _full_episode_hidden_states(
+                    model,
+                    tokenizer,
+                    episode,
+                    device=resolved_device,
+                )
+                processed_tokens += episode_tokens
+                max_sequence_tokens = max(max_sequence_tokens, episode_max)
+                control_losses: list[Any] = []
+                argument_losses: list[Any] = []
+                for row, hidden in row_hiddens:
+                    row_loss, accuracy = _control_loss(
+                        torch,
+                        row,
+                        hidden,
+                        heads=heads,
+                        action_index=action_index,
+                        device=resolved_device,
+                        pointer_loss_weight=pointer_loss_weight,
+                    )
+                    control_losses.append(row_loss)
+                    epoch_action_correct += int(accuracy["action_correct"])
+                    epoch_action_total += 1
+                    epoch_stop_correct += int(accuracy["stop_correct"])
+                    epoch_stop_total += 1
+                    optimization_action_correct += int(accuracy["action_correct"])
+                    optimization_action_total += 1
+                    optimization_stop_correct += int(accuracy["stop_correct"])
+                    optimization_stop_total += 1
+                    if accuracy["pointer_correct"] is not None:
+                        epoch_pointer_correct += int(accuracy["pointer_correct"])
+                        epoch_pointer_total += 1
+                        optimization_pointer_correct += int(accuracy["pointer_correct"])
+                        optimization_pointer_total += 1
+                    if float(argument_loss_weight) > 0:
+                        arg_loss = _argument_loss(
+                            torch,
+                            model,
+                            tokenizer,
+                            row,
+                            device=resolved_device,
+                            max_argument_chars=max_argument_chars,
+                        )
+                        if arg_loss is not None:
+                            argument_losses.append(arg_loss)
+                            epoch_argument_examples += 1
+                            argument_examples += 1
+
+                if not control_losses:
+                    continue
+                episode_loss = torch.stack(control_losses).mean()
+                if argument_losses:
+                    episode_loss = episode_loss + float(argument_loss_weight) * torch.stack(
+                        argument_losses
+                    ).mean()
+                episode_loss.backward()
+                parameters = list(heads.parameters()) + [
+                    p for p in model.parameters() if p.requires_grad
+                ]
                 torch.nn.utils.clip_grad_norm_(parameters, 1.0)
                 optimizer.step()
 
                 total_updates += 1
                 epoch_updates += 1
-                last_loss = float(loss.detach().cpu().item())
+                last_loss = float(episode_loss.detach().cpu().item())
                 epoch_loss += last_loss
-                epoch_action_correct += int(accuracy["action_correct"])
-                epoch_stop_correct += int(accuracy["stop_correct"])
-                optimization_action_correct += int(accuracy["action_correct"])
-                optimization_action_total += 1
-                optimization_stop_correct += int(accuracy["stop_correct"])
-                optimization_stop_total += 1
-                if accuracy["pointer_correct"] is not None:
-                    epoch_pointer_correct += int(accuracy["pointer_correct"])
-                    epoch_pointer_total += 1
-                    optimization_pointer_correct += int(accuracy["pointer_correct"])
-                    optimization_pointer_total += 1
 
         epoch_summary = {
             "epoch": epoch_index,
             "loss": epoch_loss / epoch_updates if epoch_updates else 0.0,
-            "action_accuracy": epoch_action_correct / epoch_updates if epoch_updates else 0.0,
-            "stop_accuracy": epoch_stop_correct / epoch_updates if epoch_updates else 0.0,
+            "action_accuracy": (
+                epoch_action_correct / epoch_action_total if epoch_action_total else 0.0
+            ),
+            "stop_accuracy": (
+                epoch_stop_correct / epoch_stop_total if epoch_stop_total else 0.0
+            ),
             "pointer_accuracy": (
                 epoch_pointer_correct / epoch_pointer_total if epoch_pointer_total else None
             ),
@@ -588,6 +737,9 @@ def train_rwkv_heads(
         "backbone_mode": resolved_backbone_mode,
         "pointer_loss_weight": float(pointer_loss_weight),
         "argument_loss_weight": float(argument_loss_weight),
+        "init_controller": initialization["controller"],
+        "init_head_tensors_loaded": initialization["head_tensors_loaded"],
+        "init_backbone_loaded": initialization["backbone_loaded"],
         "transitions": len(rows),
         "episodes": len(group_episodes(rows)),
         "train_transitions": len(train_rows),
@@ -630,8 +782,10 @@ def train_rwkv_heads(
         "value_examples": value_examples,
         "pointer_examples": len(pointer_examples),
         "argument_examples": argument_examples,
-        "feature_cache_tokens": cached_tokens,
-        "feature_cache_max_event_tokens": max_event_tokens,
+        "feature_cache_tokens": processed_tokens if frozen else 0,
+        "feature_cache_max_event_tokens": max_sequence_tokens if frozen else 0,
+        "training_tokens": processed_tokens,
+        "training_max_sequence_tokens": max_sequence_tokens,
         "feature_cache_includes_validation": frozen,
         "epoch_history": epoch_history,
         "elapsed_seconds": time.monotonic() - started,
@@ -641,6 +795,7 @@ def train_rwkv_heads(
         "backbone_frozen": frozen,
         "backbone_features_cached": frozen,
         "evaluation_uses_cached_features": frozen,
+        "full_training_granularity": None if frozen else "episode",
         "state_api": "rwkv7.state",
         "loader": "transformers-remote-code",
         "seed": seed,
