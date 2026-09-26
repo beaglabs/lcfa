@@ -20,7 +20,9 @@ from .recurrent_transitions import ACTION_VOCAB
 
 
 RWKV_CONTROLLER_FORMAT = "lcfa.rwkv-controller.v1"
-DEFAULT_RWKV_MODEL = "RWKV/RWKV7-1.5B-20260805"
+# G1j ships its RWKV-7 configuration/model implementation in the model repo,
+# unlike the older 20260805 release. Load it with trust_remote_code=True.
+DEFAULT_RWKV_MODEL = "RWKV/RWKV7-G1j-1.5B-20260831"
 
 
 class RWKVControllerError(RuntimeError):
@@ -126,10 +128,16 @@ class RWKVRecurrentPolicy:
         if dtype_value is None:
             raise RWKVControllerError(f"unsupported dtype: {dtype}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        # RWKV-7 is not yet registered in every released Transformers wheel.
+        # The G1j checkpoint ships its own compatible configuration/model code.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
             dtype=dtype_value,
+            trust_remote_code=True,
         ).to(self.device)
         self.model.eval()
         for parameter in self.model.parameters():
@@ -157,6 +165,7 @@ class RWKVRecurrentPolicy:
             "hidden_size": self.hidden_size,
             "actions": list(self.action_names),
             "stop_threshold": self.stop_threshold,
+            "loader": "transformers-remote-code",
         }
 
     def load_heads(self, path: str | Path) -> None:
