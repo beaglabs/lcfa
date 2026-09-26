@@ -13,12 +13,17 @@ from .operators import register_core_operators
 from .profile import Profile, ProfileError, load_profile
 from .protocol import ActionGraph, ActionNode, ActionResult, ActionRun, EntityRef, EvidenceRef, EvidenceValue, ExecutionContext, Finding, OperatorResult, PlanNode, ReasoningPlan, Recommendation, SolutionState
 from .recurrent_collect import COLLECTION_FORMAT, TASK_FORMAT, CollectionError, CollectionTaskResult, RecurrentCollectionTask, VerificationResult, collect_trajectories, load_tasks, task_from_dict
+from .recurrent_corrections import corrective_transitions_for_episode, prepare_corrective_transition_file, prepare_successful_rollout_transition_file
 from .recurrent_eval import EVALUATION_FORMAT, evaluate_loaded_heads, evaluate_rwkv_heads, group_episodes, split_transitions, summarize_predictions
-from .recurrent_transitions import ACTION_VOCAB, RECURRENT_TRANSITION_FORMAT, RecurrentTransition, dump_transitions, episode_to_transitions, load_episode, load_transitions, prepare_transition_file
+from .recurrent_improve import IMPROVEMENT_FORMAT, improve_controller
+from .recurrent_train import BACKBONE_MODES, TRAINING_FORMAT, train_rwkv_heads
+from .recurrent_transitions import ACTION_VOCAB, RECURRENT_TRANSITION_FORMAT, RecurrentTransition, dump_transitions, episode_to_transitions, load_episode, load_transitions, merge_transition_files, prepare_transition_file
 from .registry import ActionRegistry, ActionSpec, OperatorRegistry, OperatorSpec
+from .repair_supervision import RepairSupervisionError, RepairTarget, historical_repair_targets
 from .repo_index import IndexResult, PythonRepoIndexer
+from .repo_retrieval import RETRIEVAL_FORMAT, RetrievalCandidate, RetrievalContext, build_retrieval_context, extract_retrieval_queries, pointer_for_action, retrieval_from_mapping
 from .runtime import ActionExecutor, ActionPolicyError, PlanError, ReasoningExecutor
-from .rwkv_controller import DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError, RWKVRecurrentPolicy, RecurrentDecision, RecurrentPolicy
+from .rwkv_controller import DEFAULT_POINTER_SLOTS, DEFAULT_RWKV_MODEL, RWKV_CONTROLLER_FORMAT, RWKVControllerError, RWKVRecurrentPolicy, RecurrentDecision, RecurrentPolicy, argument_prompt
 from .rwkv_semantic import RWKVSemanticBackbone, load_rwkv_semantic_backbone
 from .semantic_agent import SEMANTIC_AGENT_TRAJECTORY_FORMAT, SemanticAgentEpisode, SemanticAgentStep, SemanticWorkspaceAgent
 from .semantic_graph import SEMANTIC_GRAPH_FORMAT, ConceptEdge, ConceptNode, ConceptSnapshot, ContentRef, SemanticGraph, SQLiteSemanticGraph
