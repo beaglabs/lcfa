@@ -65,29 +65,79 @@ class RWKVSemanticBackbone:
                 paths.append(path)
         return tuple(paths)
 
+    @staticmethod
+    def _has_aligned_priors(cognition: Mapping[str, Any]) -> bool:
+        paths = cognition.get("candidate_paths", ())
+        scores = cognition.get("candidate_scores", ())
+        evidence = cognition.get("candidate_evidence", ())
+        if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)):
+            return False
+        return (
+            isinstance(scores, Sequence)
+            and not isinstance(scores, (str, bytes))
+            and isinstance(evidence, Sequence)
+            and not isinstance(evidence, (str, bytes))
+            and len(scores) == len(paths)
+            and len(evidence) == len(paths)
+        )
+
+    @staticmethod
+    def _apply_retrieval(updated: dict[str, Any], retrieval: Any) -> dict[str, Any]:
+        updated["candidate_queries"] = list(retrieval.queries)
+        updated["candidate_paths"] = list(retrieval.candidate_paths)
+        updated["candidate_locations"] = list(retrieval.candidate_ids)
+        updated["candidate_scores"] = [float(item.score) for item in retrieval.candidates]
+        updated["candidate_evidence"] = [list(item.evidence) for item in retrieval.candidates]
+        return updated
+
     def _ensure_retrieval(self, goal: str, cognition: Mapping[str, Any]) -> Mapping[str, Any]:
         updated = dict(cognition)
         queries = self._sequence(updated, "candidate_queries")
         paths = self._sequence(updated, "candidate_paths")
-        if queries and paths:
+        if queries and paths and self._has_aligned_priors(updated):
             return updated
+
+        # Enrich existing path candidates with the same deterministic retriever
+        # used for training. Preserve the visible path order when possible.
+        try:
+            retrieval = build_retrieval_context(self.graph, goal)
+        except (AttributeError, TypeError):
+            retrieval = None
+        if retrieval is not None:
+            if paths:
+                by_path = {candidate.path: candidate for candidate in retrieval.candidates}
+                aligned = [by_path.get(path) for path in paths]
+                if all(candidate is not None for candidate in aligned):
+                    updated["candidate_queries"] = list(queries or retrieval.queries)
+                    updated["candidate_paths"] = list(paths)
+                    updated["candidate_locations"] = [
+                        candidate.concept_id for candidate in aligned if candidate is not None
+                    ]
+                    updated["candidate_scores"] = [
+                        float(candidate.score) for candidate in aligned if candidate is not None
+                    ]
+                    updated["candidate_evidence"] = [
+                        list(candidate.evidence) for candidate in aligned if candidate is not None
+                    ]
+                    return updated
+            return self._apply_retrieval(updated, retrieval)
+
         location_paths = self._paths_from_locations(updated)
         if location_paths:
             updated["candidate_paths"] = list(location_paths)
             if not queries:
                 extracted = extract_retrieval_queries(goal)
                 updated["candidate_queries"] = list(extracted or (goal,))
+            updated.setdefault("candidate_scores", [-float(i) for i in range(len(location_paths))])
+            updated.setdefault("candidate_evidence", [[] for _ in location_paths])
             return updated
-        try:
-            retrieval = build_retrieval_context(self.graph, goal)
-        except (AttributeError, TypeError):
-            extracted = extract_retrieval_queries(goal)
-            updated["candidate_queries"] = list(extracted or (goal,))
-            updated.setdefault("candidate_paths", [])
-            return updated
-        updated["candidate_queries"] = list(retrieval.queries)
-        updated["candidate_paths"] = list(retrieval.candidate_paths)
-        updated["candidate_locations"] = list(retrieval.candidate_ids)
+
+        extracted = extract_retrieval_queries(goal)
+        updated["candidate_queries"] = list(extracted or (goal,))
+        updated.setdefault("candidate_paths", [])
+        updated.setdefault("candidate_locations", [])
+        updated.setdefault("candidate_scores", [])
+        updated.setdefault("candidate_evidence", [])
         return updated
 
     def _candidate_path(
