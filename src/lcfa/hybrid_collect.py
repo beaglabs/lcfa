@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .hybrid_controller import load_hybrid_policy
+from .hybrid_semantic_controller import load_hybrid_policy
 from .recurrent_collect import (
     COLLECTION_FORMAT,
     CollectionTaskResult,
