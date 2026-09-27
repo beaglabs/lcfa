@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from .hybrid_collect import collect_hybrid_trajectories
 from .hybrid_improve import improve_hybrid_controller
-from .hybrid_train import BACKBONE_MODES, train_hybrid_controller
+from .hybrid_semantic_train import BACKBONE_MODES, train_hybrid_controller
 from .recurrent_corrections import prepare_corrective_transition_file
 from .recurrent_transitions import merge_transition_files, prepare_transition_file
 from .rwkv_controller import DEFAULT_RWKV_MODEL
@@ -50,7 +50,7 @@ def _training_args(parser: argparse.ArgumentParser, *, model_default: bool = Tru
     parser.add_argument("--argument-loss-weight", type=float, default=0.5)
     parser.add_argument("--max-argument-chars", type=int, default=8192)
     parser.add_argument("--latent-dim", type=int, default=256)
-    parser.add_argument("--latent-slots", type=int, default=8)
+    parser.add_argument("--latent-slots", type=int, default=9)
     parser.add_argument("--min-reasoning-steps", type=int, default=2)
     parser.add_argument("--max-reasoning-steps", type=int, default=6)
     parser.add_argument("--convergence-tolerance", type=float, default=1e-3)
