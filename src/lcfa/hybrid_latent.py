@@ -1,9 +1,9 @@
 """Typed latent workspace for the LCFA + RWKV hybrid software agent.
 
-The repository/semantic graph remains the source of truth.  This module owns the
-small trainable working-memory state used to reason over evidence between tool
-steps.  RWKV supplies temporal memory; the latent workspace supplies iterative
-problem-state refinement; fixed control heads consume their fused state.
+The semantic repository graph remains the source of truth.  User intent is
+compiled into an explicit contract and represented by a persistent anchored
+latent slot; mutable reasoning slots refine hypotheses/evidence/repair state
+around that anchor.  Concrete edits are compiled through grounded RepairIR.
 """
 from __future__ import annotations
 
@@ -11,12 +11,20 @@ from dataclasses import asdict, dataclass
 import json
 from typing import Any, Mapping, Sequence
 
+from .intent_ir import (
+    compile_repair_ir,
+    compile_task_intent,
+    ground_task_intent,
+    rectify_repair_ir,
+    validate_repair_ir,
+)
 from .recurrent_transitions import normalize_event
 
-HYBRID_CONTROLLER_FORMAT = "lcfa.hybrid-latent-rwkv.v1"
-HYBRID_LATENT_FORMAT = "lcfa.hybrid-latent-workspace.v1"
+HYBRID_CONTROLLER_FORMAT = "lcfa.hybrid-latent-rwkv.v2"
+HYBRID_LATENT_FORMAT = "lcfa.hybrid-latent-workspace.v2"
 
 DEFAULT_SLOT_NAMES: tuple[str, ...] = (
+    "user_intent",
     "problem",
     "hypothesis_primary",
     "hypothesis_alternative",
@@ -37,17 +45,18 @@ PLAN_FIELDS: tuple[str, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class HybridLatentConfig:
-    """Shape and recurrent-depth contract for the alpha latent workspace."""
+    """Shape and recurrent-depth contract for the hybrid latent workspace."""
 
     latent_dim: int = 256
-    slots: int = 8
+    slots: int = 9
     min_reasoning_steps: int = 2
     max_reasoning_steps: int = 6
     convergence_tolerance: float = 1e-3
+    intent_anchor_strength: float = 0.98
 
     def normalized(self) -> "HybridLatentConfig":
         latent_dim = max(16, int(self.latent_dim))
-        slots = max(4, int(self.slots))
+        slots = max(len(DEFAULT_SLOT_NAMES), int(self.slots))
         minimum = max(1, int(self.min_reasoning_steps))
         maximum = max(minimum, int(self.max_reasoning_steps))
         return HybridLatentConfig(
@@ -56,6 +65,7 @@ class HybridLatentConfig:
             min_reasoning_steps=minimum,
             max_reasoning_steps=maximum,
             convergence_tolerance=max(0.0, float(self.convergence_tolerance)),
+            intent_anchor_strength=max(0.0, min(1.0, float(self.intent_anchor_strength))),
         )
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -96,13 +106,7 @@ def structured_runtime_feedback(
     action: Mapping[str, Any] | None,
     observation: Mapping[str, Any] | None,
 ) -> Mapping[str, Any]:
-    """Turn raw tool/verifier output into compact evidence for latent updates.
-
-    The raw world remains recorded by the semantic episode.  This projection is
-    deliberately small: it captures result type, process/verifier status, useful
-    failure text and edited/read paths without turning terminal transcripts into
-    the reasoning state itself.
-    """
+    """Turn raw tool/verifier output into compact evidence for latent updates."""
     action_name = str(action.get("name") or "") if isinstance(action, Mapping) else ""
     raw = observation if isinstance(observation, Mapping) else {}
     mappings = _walk_mappings(raw)
@@ -134,7 +138,7 @@ def structured_runtime_feedback(
     kind = "observation"
     if action_name in {"test.run", "verify.run"}:
         kind = "verifier_feedback"
-    elif action_name in {"process.exec"}:
+    elif action_name == "process.exec":
         kind = "runtime_feedback"
     elif action_name in {"repo.edit", "repo.replace"}:
         kind = "edit_feedback"
@@ -186,7 +190,6 @@ def supervised_plan_targets(
     stop_target: bool,
     value_target: float | None,
 ) -> tuple[float | None, ...]:
-    """Cheap semantic supervision for the alpha repair-plan projection."""
     name = str(action)
     repair = 1.0 if name in {"repo.replace", "repo.edit"} else 0.0
     evidence = 1.0 if name in {
@@ -205,19 +208,36 @@ def supervised_repair_plan(
     candidate_paths: Sequence[str] = (),
     value_target: float | None = None,
 ) -> Mapping[str, Any]:
+    """Build the same intent/RepairIR contract used at runtime for supervision."""
     inputs = target_inputs if isinstance(target_inputs, Mapping) else {}
-    path = str(inputs.get("path") or "") or None
+    target_path = str(inputs.get("path") or "") or None
+    visible_paths = [str(item) for item in candidate_paths[:16] if str(item)]
+    if target_path:
+        visible_paths = [target_path, *[item for item in visible_paths if item != target_path]]
+    contract = compile_task_intent(goal)
+    grounded = ground_task_intent(
+        contract,
+        {"candidate_paths": visible_paths, "candidate_locations": (), "active_concepts": ()},
+        pointer_index=0,
+    )
+    ir = compile_repair_ir(
+        grounded,
+        action=action,
+        pointer_index=0,
+        expected_verifier_success=value_target,
+    )
+    validation = validate_repair_ir(ir, grounded)
+    if not validation.valid:
+        ir = rectify_repair_ir(ir, grounded)
+        validation = validate_repair_ir(ir, grounded)
     return {
         "format": HYBRID_LATENT_FORMAT,
-        "goal": str(goal),
-        "intended_action": str(action),
-        "target_path": path,
-        "candidate_paths": [str(item) for item in candidate_paths[:16]],
-        "required_changes": ([f"apply {action} to {path}"] if path and action in {"repo.replace", "repo.edit"} else []),
-        "invariants": ["preserve unrelated repository behavior", "satisfy the external verifier"],
-        "expected_verifier_success": (
-            None if value_target is None else max(0.0, min(1.0, float(value_target)))
-        ),
+        "task_intent": contract.to_dict(),
+        "grounded_intent": grounded.to_dict(),
+        "repair_ir": ir.to_dict(),
+        "repair_ir_validation": validation.to_dict(),
+        "repair_readiness": 1.0 if action in {"repo.replace", "repo.edit"} else 0.0,
+        "expected_verifier_success": value_target,
     }
 
 
@@ -231,50 +251,40 @@ def repair_plan_from_state(
     slots: int,
     reasoning_depth: int,
 ) -> Mapping[str, Any]:
-    paths_raw = cognition.get("candidate_paths", ())
-    paths = (
-        tuple(str(item) for item in paths_raw if str(item))
-        if isinstance(paths_raw, Sequence) and not isinstance(paths_raw, (str, bytes))
-        else ()
-    )
-    locations_raw = cognition.get("candidate_locations", ())
-    locations = (
-        tuple(str(item) for item in locations_raw if str(item))
-        if isinstance(locations_raw, Sequence) and not isinstance(locations_raw, (str, bytes))
-        else ()
-    )
-    concepts_raw = cognition.get("active_concepts", ())
-    concepts = (
-        tuple(str(item) for item in concepts_raw if str(item))
-        if isinstance(concepts_raw, Sequence) and not isinstance(concepts_raw, (str, bytes))
-        else ()
-    )
+    """Compile mutable latent decisions around an immutable user intent contract."""
+    probs = [float(item) for item in plan_probabilities[: len(PLAN_FIELDS)]]
+    while len(probs) < len(PLAN_FIELDS):
+        probs.append(0.0)
+    values = dict(zip(PLAN_FIELDS, probs))
+    contract = compile_task_intent(goal)
+    grounded = ground_task_intent(contract, cognition, pointer_index=pointer_index)
     questions_raw = cognition.get("open_questions", ())
     questions = (
         tuple(str(item) for item in questions_raw if str(item))
         if isinstance(questions_raw, Sequence) and not isinstance(questions_raw, (str, bytes))
         else ()
     )
-    pointer = int(pointer_index or 0)
-    target_path = paths[pointer % len(paths)] if paths else None
-    probs = [float(item) for item in plan_probabilities[: len(PLAN_FIELDS)]]
-    while len(probs) < len(PLAN_FIELDS):
-        probs.append(0.0)
-    values = dict(zip(PLAN_FIELDS, probs))
+    ir = compile_repair_ir(
+        grounded,
+        action=action,
+        pointer_index=pointer_index,
+        expected_verifier_success=values["verifier_expectation"],
+        unresolved_questions=questions[:6],
+        reasoning_depth=reasoning_depth,
+    )
+    validation = validate_repair_ir(ir, grounded)
+    rectified = False
+    if not validation.valid:
+        ir = rectify_repair_ir(ir, grounded)
+        validation = validate_repair_ir(ir, grounded)
+        rectified = True
     return {
         "format": HYBRID_LATENT_FORMAT,
-        "goal": str(goal),
-        "target_path": target_path,
-        "target_symbols": list(locations[:8]),
-        "intended_action": str(action),
-        "required_changes": (
-            [f"apply {action} to {target_path}"]
-            if target_path and action in {"repo.replace", "repo.edit"}
-            else []
-        ),
-        "invariants": ["preserve unrelated repository behavior", "satisfy the external verifier"],
-        "evidence_refs": list(concepts[:12]),
-        "unresolved_questions": list(questions[:6]),
+        "task_intent": contract.to_dict(),
+        "grounded_intent": grounded.to_dict(),
+        "repair_ir": ir.to_dict(),
+        "repair_ir_validation": validation.to_dict(),
+        "repair_ir_rectified": rectified,
         "repair_readiness": values["repair_readiness"],
         "needs_more_evidence": values["evidence_need"],
         "expected_verifier_success": values["verifier_expectation"],
@@ -292,21 +302,32 @@ def repair_prompt(
     target_path: str | None,
     repair_plan: Mapping[str, Any] | None,
 ) -> str:
-    """Dedicated semantic patch/action renderer prompt.
+    """Compile validated semantic intent into exact action arguments.
 
-    The controller has already selected the action.  This renderer is only
-    allowed to materialize exact action arguments from a reasoned repair plan
-    and exact retrieved evidence.
+    Semantic planning remains free-form inside latent cognition / RepairIR.  The
+    renderer is deliberately narrow: it must obey the immutable user contract,
+    grounded repository target, and validated RepairIR.
     """
+    context = dict(repair_plan or {})
+    task_intent = context.get("task_intent", {})
+    grounded = context.get("grounded_intent", {})
+    repair_ir = context.get("repair_ir", {})
+    validation = context.get("repair_ir_validation", {})
     return (
-        "LCFA semantic patch renderer. The hybrid latent controller already chose the action.\n"
-        "Materialize ONLY the exact JSON inputs for that action; do not choose another action.\n"
+        "LCFA constrained semantic patch compiler.\n"
+        "The user intent contract is the immutable source of truth.\n"
+        "The controller has already chosen the action and RepairIR target.\n"
+        "Return ONLY one JSON object containing exact inputs for that action.\n"
+        "Do not choose another action, target another file, or invent unrelated changes.\n"
         "For repo.replace return path, old and new. For repo.edit return path and content.\n"
-        "Use the target file and evidence literally; do not invent unrelated edits.\n"
+        "Preserve every invariant and prohibited outcome in the intent/RepairIR.\n"
         f"action={action}\n"
         f"goal={goal}\n"
         f"target_path={target_path or ''}\n"
-        f"repair_plan={json.dumps(dict(repair_plan or {}), sort_keys=True, ensure_ascii=False, default=str)}\n"
+        f"task_intent={json.dumps(task_intent, sort_keys=True, ensure_ascii=False, default=str)}\n"
+        f"grounded_intent={json.dumps(grounded, sort_keys=True, ensure_ascii=False, default=str)}\n"
+        f"repair_ir={json.dumps(repair_ir, sort_keys=True, ensure_ascii=False, default=str)}\n"
+        f"repair_ir_validation={json.dumps(validation, sort_keys=True, ensure_ascii=False, default=str)}\n"
         f"event={json.dumps(hybrid_event(event), sort_keys=True, ensure_ascii=False, default=str)}\n"
     )
 
@@ -318,7 +339,7 @@ def make_hybrid_core(
     config: HybridLatentConfig,
     device: str,
 ) -> Any:
-    """Build the trainable typed latent workspace without importing torch globally."""
+    """Build the trainable latent workspace with a persistent z_intent slot."""
     cfg = config.normalized()
     nn = torch.nn
 
@@ -331,46 +352,62 @@ def make_hybrid_core(
             self.min_reasoning_steps = int(cfg.min_reasoning_steps)
             self.max_reasoning_steps = int(cfg.max_reasoning_steps)
             self.convergence_tolerance = float(cfg.convergence_tolerance)
+            self.intent_anchor_strength = float(cfg.intent_anchor_strength)
             self.slot_seed = nn.Parameter(torch.empty(self.slots, self.latent_dim))
             nn.init.normal_(self.slot_seed, mean=0.0, std=0.02)
+            self.intent_projection = nn.Linear(self.hidden_size, self.latent_dim)
             self.evidence_projection = nn.Linear(self.hidden_size, self.latent_dim)
-            self.update = nn.GRUCell(self.latent_dim * 2, self.latent_dim)
+            self.update = nn.GRUCell(self.latent_dim * 3, self.latent_dim)
             self.norm = nn.LayerNorm(self.latent_dim)
             self.fusion = nn.Sequential(
-                nn.Linear(self.hidden_size + self.latent_dim, self.hidden_size),
+                nn.Linear(self.hidden_size + self.latent_dim * 2, self.hidden_size),
                 nn.GELU(),
                 nn.Linear(self.hidden_size, self.hidden_size),
             )
-            self.plan = nn.Linear(self.latent_dim, len(PLAN_FIELDS))
+            self.plan = nn.Linear(self.latent_dim * 2, len(PLAN_FIELDS))
 
         def forward(self, hidden: Any, latent: Any | None = None) -> tuple[Any, Any, Any, int]:
             source = hidden.float()
             evidence = torch.tanh(self.evidence_projection(source))
             batch = int(source.shape[0])
             if latent is None:
-                latent = self.slot_seed.unsqueeze(0).expand(batch, -1, -1)
+                intent_anchor = torch.tanh(self.intent_projection(source))
+                latent = self.slot_seed.unsqueeze(0).expand(batch, -1, -1).clone()
                 latent = latent + evidence.unsqueeze(1)
+                latent[:, 0, :] = intent_anchor
+            else:
+                # Slot zero is the persistent user-intent anchor.  Tool/verifier
+                # events may refine its edge, but cannot freely overwrite it.
+                intent_anchor = latent[:, 0, :]
 
             depth = 0
             for index in range(self.max_reasoning_steps):
-                pooled = latent.mean(dim=1)
-                update_input = torch.cat([evidence, pooled], dim=-1)
+                reasoning = latent[:, 1:, :] if self.slots > 1 else latent
+                pooled = reasoning.mean(dim=1)
+                update_input = torch.cat([evidence, pooled, intent_anchor], dim=-1)
                 update_input = update_input.unsqueeze(1).expand(-1, self.slots, -1)
                 previous = latent
                 updated = self.update(
-                    update_input.reshape(batch * self.slots, self.latent_dim * 2),
+                    update_input.reshape(batch * self.slots, self.latent_dim * 3),
                     previous.reshape(batch * self.slots, self.latent_dim),
                 ).reshape(batch, self.slots, self.latent_dim)
                 latent = self.norm(updated + previous)
+                proposed_intent = latent[:, 0, :]
+                strength = self.intent_anchor_strength
+                latent[:, 0, :] = self.norm(
+                    strength * intent_anchor + (1.0 - strength) * proposed_intent
+                )
                 depth = index + 1
                 if depth >= self.min_reasoning_steps and self.convergence_tolerance > 0:
-                    delta = float((latent - previous).detach().abs().mean().item())
+                    delta = float((latent[:, 1:, :] - previous[:, 1:, :]).detach().abs().mean().item())
                     if delta <= self.convergence_tolerance:
                         break
 
-            pooled = latent.mean(dim=1)
-            fused = source + self.fusion(torch.cat([source, pooled], dim=-1))
-            plan_logits = self.plan(pooled)
+            intent_anchor = latent[:, 0, :]
+            reasoning = latent[:, 1:, :] if self.slots > 1 else latent
+            pooled = reasoning.mean(dim=1)
+            fused = source + self.fusion(torch.cat([source, intent_anchor, pooled], dim=-1))
+            plan_logits = self.plan(torch.cat([intent_anchor, pooled], dim=-1))
             return fused, latent, plan_logits, depth
 
     return HybridLatentCore().to(device)
