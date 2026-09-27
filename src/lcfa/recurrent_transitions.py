@@ -31,16 +31,18 @@ except ImportError:  # pragma: no cover - exercised by detached historical verif
         return None
 
 
-RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v3"
+RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v4"
 LEGACY_RECURRENT_TRANSITION_FORMATS = (
     "lcfa.recurrent-transition.v1",
     "lcfa.recurrent-transition.v2",
+    "lcfa.recurrent-transition.v3",
 )
 LEGACY_RECURRENT_TRANSITION_FORMAT = LEGACY_RECURRENT_TRANSITION_FORMATS[0]
 MAX_RECURRENT_TEXT_CHARS = 4096
 MAX_RECURRENT_SEQUENCE_ITEMS = 24
 MAX_RETRIEVAL_QUERIES_IN_EVENT = 8
 MAX_RETRIEVAL_PATHS_IN_EVENT = 16
+MAX_RETRIEVAL_ENTITIES_IN_EVENT = 16
 
 ACTION_VOCAB: tuple[str, ...] = (
     "repo.read",
@@ -71,6 +73,7 @@ class RecurrentTransition:
     target_pointer: int | None = None
     candidate_queries: tuple[str, ...] = ()
     candidate_paths: tuple[str, ...] = ()
+    candidate_entities: tuple[str, ...] = ()
     schema_version: str = RECURRENT_TRANSITION_FORMAT
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -191,22 +194,34 @@ def _retrieval_summary(value: Mapping[str, Any] | None) -> Mapping[str, Any] | N
         else []
     )
     raw_paths = value.get("paths", ())
-    if not raw_paths:
-        candidates = value.get("candidates", ())
-        if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+    raw_entities = value.get("entities", ())
+    candidates = value.get("candidates", ())
+    if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+        if not raw_paths:
             raw_paths = [
                 str(item.get("path"))
                 for item in candidates
                 if isinstance(item, Mapping) and item.get("path")
+            ]
+        if not raw_entities:
+            raw_entities = [
+                str(item.get("concept_id"))
+                for item in candidates
+                if isinstance(item, Mapping) and item.get("concept_id")
             ]
     paths = (
         [str(item) for item in raw_paths[:MAX_RETRIEVAL_PATHS_IN_EVENT]]
         if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes))
         else []
     )
-    if not queries and not paths:
+    entities = (
+        [str(item) for item in raw_entities[:MAX_RETRIEVAL_ENTITIES_IN_EVENT]]
+        if isinstance(raw_entities, Sequence) and not isinstance(raw_entities, (str, bytes))
+        else []
+    )
+    if not queries and not paths and not entities:
         return None
-    return {"queries": queries, "paths": paths}
+    return {"queries": queries, "paths": paths, "entities": entities}
 
 
 def normalize_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -269,6 +284,7 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
     retrieval = retrieval_from_mapping(_mapping(episode_metadata.get("retrieval")))
     candidate_queries = retrieval.queries if retrieval is not None else ()
     candidate_paths = retrieval.candidate_paths if retrieval is not None else ()
+    candidate_entities = retrieval.candidate_ids if retrieval is not None else ()
     value_target = _episode_success(episode)
     previous_action: Mapping[str, Any] | None = None
     previous_observation: Mapping[str, Any] = {}
@@ -284,10 +300,11 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
 
         if position == 1:
             goal_event: dict[str, Any] = {"kind": "goal", "goal": goal}
-            if candidate_queries or candidate_paths:
+            if candidate_queries or candidate_paths or candidate_entities:
                 goal_event["retrieval"] = {
                     "queries": list(candidate_queries),
                     "paths": list(candidate_paths),
+                    "entities": list(candidate_entities),
                 }
             event: Mapping[str, Any] = normalize_event(goal_event)
         else:
@@ -310,6 +327,7 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
             target_pointer=pointer_for_action(action_name, inputs, retrieval),
             candidate_queries=tuple(candidate_queries),
             candidate_paths=tuple(candidate_paths),
+            candidate_entities=tuple(candidate_entities),
         ))
         previous_action = dict(action) if action else None
         previous_observation = dict(_mapping(step.get("observation")))
@@ -338,6 +356,7 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
                 raise ValueError(f"transition line {line_number} has wrong schema_version")
             raw_queries = raw.get("candidate_queries", ())
             raw_paths = raw.get("candidate_paths", ())
+            raw_entities = raw.get("candidate_entities", ())
             rows.append(RecurrentTransition(
                 episode_id=str(raw["episode_id"]),
                 step_index=int(raw["step_index"]),
@@ -360,6 +379,11 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
                 candidate_paths=(
                     tuple(str(item) for item in raw_paths)
                     if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes))
+                    else ()
+                ),
+                candidate_entities=(
+                    tuple(str(item) for item in raw_entities)
+                    if isinstance(raw_entities, Sequence) and not isinstance(raw_entities, (str, bytes))
                     else ()
                 ),
             ))
