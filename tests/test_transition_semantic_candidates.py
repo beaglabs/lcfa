@@ -50,29 +50,45 @@ def _episode() -> dict:
     }
 
 
-def test_episode_transitions_keep_aligned_semantic_candidate_ids() -> None:
+def test_episode_transitions_keep_aligned_semantic_candidate_priors() -> None:
     row = episode_to_transitions(_episode())[0]
     assert row.candidate_paths == ("pkg/widget.py", "tests/test_widget.py")
     assert row.candidate_entities == (
         "method://pkg/widget.py:Widget.render",
         "test://tests/test_widget.py:test_render",
     )
+    assert row.candidate_scores == (10.0, 5.0)
+    assert row.candidate_evidence == (("exact:Widget.render",), ())
     assert row.target_pointer == 0
     assert row.event["retrieval"]["entities"][0] == "method://pkg/widget.py:Widget.render"
 
 
-def test_v4_round_trip_and_v3_compatibility(tmp_path: Path) -> None:
+def test_v5_round_trip_and_v3_v4_compatibility(tmp_path: Path) -> None:
     row = episode_to_transitions(_episode())[0]
     path = tmp_path / "rows.jsonl"
     path.write_text(json.dumps(row.to_dict()) + "\n", encoding="utf-8")
     loaded = load_transitions(path)[0]
     assert loaded.candidate_entities == row.candidate_entities
+    assert loaded.candidate_scores == row.candidate_scores
+    assert loaded.candidate_evidence == row.candidate_evidence
 
-    legacy = tmp_path / "legacy.jsonl"
-    payload = dict(row.to_dict())
-    payload["schema_version"] = "lcfa.recurrent-transition.v3"
-    payload.pop("candidate_entities", None)
-    legacy.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-    legacy_row = load_transitions(legacy)[0]
-    assert legacy_row.candidate_entities == ()
-    assert RECURRENT_TRANSITION_FORMAT == "lcfa.recurrent-transition.v4"
+    legacy_v4 = tmp_path / "legacy-v4.jsonl"
+    v4_payload = dict(row.to_dict())
+    v4_payload["schema_version"] = "lcfa.recurrent-transition.v4"
+    v4_payload.pop("candidate_scores", None)
+    v4_payload.pop("candidate_evidence", None)
+    legacy_v4.write_text(json.dumps(v4_payload) + "\n", encoding="utf-8")
+    v4_row = load_transitions(legacy_v4)[0]
+    assert v4_row.candidate_entities == row.candidate_entities
+    assert v4_row.candidate_scores == ()
+    assert v4_row.candidate_evidence == ()
+
+    legacy_v3 = tmp_path / "legacy-v3.jsonl"
+    v3_payload = dict(v4_payload)
+    v3_payload["schema_version"] = "lcfa.recurrent-transition.v3"
+    v3_payload.pop("candidate_entities", None)
+    legacy_v3.write_text(json.dumps(v3_payload) + "\n", encoding="utf-8")
+    v3_row = load_transitions(legacy_v3)[0]
+    assert v3_row.candidate_entities == ()
+    assert v3_row.candidate_scores == ()
+    assert RECURRENT_TRANSITION_FORMAT == "lcfa.recurrent-transition.v5"
