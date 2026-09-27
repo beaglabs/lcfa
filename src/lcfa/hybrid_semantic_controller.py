@@ -34,6 +34,29 @@ from .semantic_pointer import (
 )
 
 
+def pointer_runtime_mode(
+    validation_pointer_accuracy: Any,
+    validation_retrieval_prior_accuracy: Any,
+) -> str:
+    """Use the learned pointer only when held-out data does not show a regression."""
+    try:
+        pointer = (
+            None
+            if validation_pointer_accuracy is None
+            else float(validation_pointer_accuracy)
+        )
+        prior = (
+            None
+            if validation_retrieval_prior_accuracy is None
+            else float(validation_retrieval_prior_accuracy)
+        )
+    except (TypeError, ValueError):
+        return "semantic"
+    if pointer is not None and prior is not None and pointer < prior:
+        return "retrieval-prior"
+    return "semantic"
+
+
 class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
     """Hybrid controller reranking actual visible semantic candidates."""
 
@@ -43,6 +66,8 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         *,
         semantic_pointer_weights_path: str | Path,
         pointer_format: str = SEMANTIC_POINTER_FORMAT,
+        validation_pointer_accuracy: float | None = None,
+        validation_retrieval_prior_accuracy: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_id, **kwargs)
@@ -52,6 +77,12 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
             raise RuntimeError("semantic pointer requires safetensors torch support") from exc
 
         self.pointer_format = str(pointer_format or LEGACY_SEMANTIC_POINTER_FORMAT)
+        self.pointer_runtime_mode = pointer_runtime_mode(
+            validation_pointer_accuracy,
+            validation_retrieval_prior_accuracy,
+        )
+        self.validation_pointer_accuracy = validation_pointer_accuracy
+        self.validation_retrieval_prior_accuracy = validation_retrieval_prior_accuracy
         if self.pointer_format == LEGACY_SEMANTIC_POINTER_FORMAT:
             self.semantic_pointer = make_legacy_semantic_pointer(
                 self._torch,
@@ -108,6 +139,9 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                 if self.pointer_format in semantic_formats
                 else None
             ),
+            "pointer_runtime_mode": self.pointer_runtime_mode,
+            "validation_pointer_accuracy": self.validation_pointer_accuracy,
+            "validation_retrieval_prior_accuracy": self.validation_retrieval_prior_accuracy,
             "repair_phase_policy": "discover->ground->mutate->verify->done",
             "premutation_verification_blocked": True,
             "evidence_loop_hard_lock": 4,
@@ -215,6 +249,19 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                         self._torch.tanh(gate.detach().float()).item()
                     )
 
+        if (
+            self.pointer_runtime_mode == "retrieval-prior"
+            and self._last_pointer_prior_index is not None
+        ):
+            return RecurrentDecision(
+                action=base.action,
+                action_confidence=base.action_confidence,
+                stop_probability=base.stop_probability,
+                value=base.value,
+                pointer_index=self._last_pointer_prior_index,
+                pointer_confidence=self._last_pointer_prior_confidence,
+            )
+
         with self._torch.inference_mode():
             if self.pointer_format == PAIRWISE_SEMANTIC_POINTER_FORMAT:
                 pointer_index, pointer_confidence, _ = pairwise_semantic_pointer_decision(
@@ -273,6 +320,7 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         controller = result.get("controller") if isinstance(result, Mapping) else None
         if isinstance(controller, dict):
             controller["pointer_architecture"] = self.metadata["pointer_architecture"]
+            controller["pointer_runtime_mode"] = self.pointer_runtime_mode
             controller["pointer_prior_index"] = self._last_pointer_prior_index
             controller["pointer_prior_confidence"] = self._last_pointer_prior_confidence
             controller["pointer_residual_gate"] = self._last_pointer_residual_gate
@@ -351,6 +399,8 @@ def load_hybrid_policy(
         hybrid_weights_path=resolved_root / str(raw.get("hybrid_weights") or "hybrid.safetensors"),
         semantic_pointer_weights_path=resolved_root / str(semantic_weights),
         pointer_format=str(raw.get("pointer_format") or LEGACY_SEMANTIC_POINTER_FORMAT),
+        validation_pointer_accuracy=raw.get("validation_pointer_accuracy"),
+        validation_retrieval_prior_accuracy=raw.get("validation_retrieval_prior_accuracy"),
         backbone_weights_path=(resolved_root / str(backbone) if backbone else None),
         hybrid_config=config,
         device=device,
@@ -362,4 +412,8 @@ def load_hybrid_policy(
     )
 
 
-__all__ = ["SemanticPointerHybridPolicy", "load_hybrid_policy"]
+__all__ = [
+    "SemanticPointerHybridPolicy",
+    "load_hybrid_policy",
+    "pointer_runtime_mode",
+]
