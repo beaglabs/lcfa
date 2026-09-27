@@ -1,4 +1,4 @@
-"""Live LCFA policy combining typed latent cognition with RWKV trajectory memory."""
+"""Live LCFA policy combining anchored user intent, latent cognition and RWKV memory."""
 from __future__ import annotations
 
 import json
@@ -26,13 +26,16 @@ from .rwkv_controller import (
 )
 from .torch_runtime import resolve_device, resolve_dtype
 
+_EDIT_ACTIONS = {"repo.replace", "repo.edit"}
+
 
 class SemanticPatchDecoder:
-    """Dedicated renderer from a reasoned repair plan to exact action arguments.
+    """Narrow compiler from validated RepairIR to exact action arguments.
 
-    The alpha shares the RWKV language head to avoid adding a second large model,
-    but patch rendering has its own prompt/contract and no longer doubles as the
-    control policy.  The interface can later be swapped for a smaller decoder.
+    The alpha shares the RWKV language head to avoid a second large decoder, but
+    it is no longer asked to infer the repair.  The user contract, grounded
+    target and RepairIR are already fixed; this component only materializes the
+    source-level arguments under that contract.
     """
 
     def __init__(self, *, model: Any, tokenizer: Any, device: str, max_tokens: int) -> None:
@@ -52,7 +55,7 @@ class SemanticPatchDecoder:
     ) -> Mapping[str, Any] | None:
         try:
             import torch
-        except ImportError as exc:  # pragma: no cover - guarded by controller init
+        except ImportError as exc:  # pragma: no cover
             raise RWKVControllerError("hybrid patch decoder requires torch") from exc
 
         prompt = repair_prompt(
@@ -80,7 +83,8 @@ class SemanticPatchDecoder:
         if parsed is None:
             return None
         inputs = dict(parsed)
-        if target_path and action in {"repo.replace", "repo.edit"}:
+        if target_path and action in _EDIT_ACTIONS:
+            # RepairIR owns target selection; the renderer cannot redirect it.
             inputs["path"] = target_path
         if not _valid_generated_inputs(action, inputs):
             return None
@@ -88,7 +92,7 @@ class SemanticPatchDecoder:
 
 
 class HybridLatentRWKVPolicy:
-    """Hybrid software-agent policy: latent workspace + RWKV recurrent memory."""
+    """Hybrid agent: immutable task intent + latent repair reasoning + RWKV memory."""
 
     def __init__(
         self,
@@ -206,10 +210,11 @@ class HybridLatentRWKVPolicy:
             "loader": "transformers-remote-code",
             "device": self.device,
             "dtype": self.dtype_name,
-            "event_schema": "goal + retrieval + structured tool/verifier feedback",
+            "event_schema": "goal + semantic grounding + structured tool/verifier feedback",
             "hybrid_config": dict(self.hybrid_config.to_dict()),
             "backbone_weights": str(backbone_weights_path) if backbone_weights_path else None,
-            "patch_decoder": "shared-rwkv-language-head-dedicated-repair-contract",
+            "intent_pipeline": "TaskIntentContract->GroundedTaskIntent->z_intent->RepairIR",
+            "patch_decoder": "validated-repair-ir->shared-rwkv-language-head",
         }
 
     def _forward_event(self, payload: Mapping[str, Any]) -> None:
@@ -256,6 +261,8 @@ class HybridLatentRWKVPolicy:
         self._reasoning_depth = 0
         self._goal = str(goal)
         self._event_history = []
+        # The first RWKV event contains the original request plus retrieval; the
+        # hybrid core converts this first hidden state into persistent z_intent.
         self._forward_event({
             "kind": "goal",
             "goal": self._goal,
@@ -359,6 +366,45 @@ class HybridLatentRWKVPolicy:
             return {}
         return None
 
+    @staticmethod
+    def _validated_ir_target(plan: Mapping[str, Any]) -> tuple[str | None, bool, tuple[str, ...]]:
+        ir = plan.get("repair_ir") if isinstance(plan.get("repair_ir"), Mapping) else {}
+        validation = (
+            plan.get("repair_ir_validation")
+            if isinstance(plan.get("repair_ir_validation"), Mapping)
+            else {}
+        )
+        target_path = str(ir.get("target_path") or "") or None
+        valid = bool(validation.get("valid", False))
+        errors_raw = validation.get("errors", ())
+        errors = (
+            tuple(str(item) for item in errors_raw)
+            if isinstance(errors_raw, Sequence) and not isinstance(errors_raw, (str, bytes))
+            else ()
+        )
+        return target_path, valid, errors
+
+    def _rendered_inputs_match_ir(
+        self,
+        *,
+        action: str,
+        inputs: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        solution: SolutionState,
+    ) -> tuple[bool, str | None]:
+        if action not in _EDIT_ACTIONS:
+            return True, None
+        target_path, valid_ir, errors = self._validated_ir_target(plan)
+        if not valid_ir:
+            return False, "RepairIR failed validation: " + "; ".join(errors)
+        rendered_path = str(inputs.get("path") or "") or None
+        if target_path and rendered_path != target_path:
+            return False, "renderer attempted to diverge from RepairIR target path"
+        visible_paths = set(self._sequence(_compact_cognition(solution), "candidate_paths"))
+        if visible_paths and rendered_path not in visible_paths:
+            return False, "renderer targeted a path not visible during semantic grounding"
+        return True, None
+
     def choose(
         self,
         goal: str,
@@ -376,14 +422,17 @@ class HybridLatentRWKVPolicy:
             solution=solution,
         )
         controller = {
-            "architecture": "hybrid-latent-rwkv",
+            "architecture": "intent-grounded-hybrid-latent-rwkv",
             "action_confidence": decision.action_confidence,
             "stop_probability": decision.stop_probability,
             "value": decision.value,
             "pointer_index": decision.pointer_index,
             "pointer_confidence": decision.pointer_confidence,
             "reasoning_depth": self._reasoning_depth,
-            "repair_plan": plan,
+            "task_intent": plan.get("task_intent"),
+            "grounded_intent": plan.get("grounded_intent"),
+            "repair_ir": plan.get("repair_ir"),
+            "repair_ir_validation": plan.get("repair_ir_validation"),
         }
         if decision.action == "stop" or decision.stop_probability >= self.stop_threshold:
             return {
@@ -397,17 +446,33 @@ class HybridLatentRWKVPolicy:
             decision.action, goal, solution, decision.pointer_index
         )
         if inputs is None:
-            target_path = self._candidate_path(solution, decision.pointer_index)
-            event = self._event_history[-1] if self._event_history else {
-                "kind": "goal", "goal": goal
-            }
-            inputs = self.patch_decoder.render(
-                action=decision.action,
-                goal=goal,
-                event=event,
-                target_path=target_path,
-                repair_plan=plan,
-            )
+            target_path, valid_ir, ir_errors = self._validated_ir_target(plan)
+            if decision.action in _EDIT_ACTIONS and not valid_ir:
+                inputs = None
+            else:
+                event = self._event_history[-1] if self._event_history else {
+                    "kind": "goal", "goal": goal
+                }
+                inputs = self.patch_decoder.render(
+                    action=decision.action,
+                    goal=goal,
+                    event=event,
+                    target_path=target_path,
+                    repair_plan=plan,
+                )
+                if inputs is not None:
+                    matched, reason = self._rendered_inputs_match_ir(
+                        action=decision.action,
+                        inputs=inputs,
+                        plan=plan,
+                        solution=solution,
+                    )
+                    if not matched:
+                        controller["render_validation_error"] = reason
+                        inputs = None
+                elif ir_errors:
+                    controller["repair_ir_errors"] = list(ir_errors)
+
         if inputs is None:
             query = self._candidate_query(solution, decision.pointer_index) or goal
             return {
@@ -417,7 +482,7 @@ class HybridLatentRWKVPolicy:
                 "controller": {
                     **controller,
                     "fallback_from": decision.action,
-                    "fallback_reason": "semantic patch renderer returned invalid inputs",
+                    "fallback_reason": "intent-grounded RepairIR/renderer could not produce a valid action",
                 },
             }
         return {
@@ -456,7 +521,7 @@ def load_hybrid_policy(
         raise ValueError("controller manifest must be a JSON object")
     if raw.get("controller_format") != HYBRID_CONTROLLER_FORMAT:
         raise ValueError(
-            f"not a hybrid LCFA controller: {raw.get('controller_format')!r}"
+            f"not an intent-grounded hybrid LCFA controller: {raw.get('controller_format')!r}"
         )
     resolved_root = manifest_path.parent
     resolved_model = str(model_id or raw.get("model_id") or "")
@@ -469,10 +534,11 @@ def load_hybrid_policy(
     config_map = config_raw if isinstance(config_raw, Mapping) else {}
     config = HybridLatentConfig(
         latent_dim=int(config_map.get("latent_dim", 256)),
-        slots=int(config_map.get("slots", 8)),
+        slots=int(config_map.get("slots", 9)),
         min_reasoning_steps=int(config_map.get("min_reasoning_steps", 2)),
         max_reasoning_steps=int(config_map.get("max_reasoning_steps", 6)),
         convergence_tolerance=float(config_map.get("convergence_tolerance", 1e-3)),
+        intent_anchor_strength=float(config_map.get("intent_anchor_strength", 0.98)),
     )
     backbone_weights = raw.get("backbone_weights")
     return HybridLatentRWKVPolicy(
