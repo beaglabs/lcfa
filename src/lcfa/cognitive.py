@@ -10,7 +10,7 @@ from .repo_retrieval import build_retrieval_context
 from .semantic_graph import ConceptNode, SQLiteSemanticGraph
 from .state import content_hash
 
-COGNITIVE_STATE_FORMAT = "lcfa.cognition.v2"
+COGNITIVE_STATE_FORMAT = "lcfa.cognition.v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +32,8 @@ class CognitiveState:
     candidate_locations: tuple[str, ...] = ()
     candidate_queries: tuple[str, ...] = ()
     candidate_paths: tuple[str, ...] = ()
+    candidate_scores: tuple[float, ...] = ()
+    candidate_evidence: tuple[tuple[str, ...], ...] = ()
     observations: tuple[Mapping[str, Any], ...] = ()
     next_actions: tuple[Mapping[str, Any], ...] = ()
     terminal: bool = False
@@ -147,6 +149,8 @@ class SemanticInvestigator:
             candidate_locations=tuple(candidate.concept_id for candidate in retrieval.candidates),
             candidate_queries=retrieval.queries,
             candidate_paths=retrieval.candidate_paths,
+            candidate_scores=tuple(float(candidate.score) for candidate in retrieval.candidates),
+            candidate_evidence=tuple(tuple(candidate.evidence) for candidate in retrieval.candidates),
             next_actions=tuple(next_actions),
             terminal=False,
         )
