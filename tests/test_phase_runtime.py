@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from lcfa.hybrid_semantic_controller import pointer_runtime_mode
 from lcfa.phase_runtime import (
     PhaseMutationRuntimePolicy,
     attach_controller_trace,
@@ -63,6 +64,12 @@ def test_validate_replace_inputs_requires_unique_grounded_span() -> None:
     ) is None
 
 
+def test_pointer_runtime_mode_falls_back_when_learned_pointer_regresses() -> None:
+    assert pointer_runtime_mode(0.125, 0.25) == "retrieval-prior"
+    assert pointer_runtime_mode(0.5, 0.25) == "semantic"
+    assert pointer_runtime_mode(None, 0.25) == "semantic"
+
+
 def test_attach_controller_trace_persists_step_diagnostics(tmp_path) -> None:
     path = tmp_path / "episode.json"
     path.write_text(
@@ -94,6 +101,7 @@ class _FakeInnerPolicy:
 
     def __init__(self) -> None:
         self.observed = []
+        self.calls = 0
 
     def reset(self, goal, solution) -> None:
         del goal, solution
@@ -104,6 +112,12 @@ class _FakeInnerPolicy:
 
     def choose(self, goal, solution, recent, step):
         del goal, solution, recent, step
+        self.calls += 1
+        target = (
+            "src/lcfa/example.py"
+            if self.calls == 1
+            else "src/lcfa/drifted.py"
+        )
         return {
             "hypothesis": None,
             "action": {"name": "repo.search", "inputs": {"query": "fallback"}},
@@ -112,7 +126,7 @@ class _FakeInnerPolicy:
                 "repair_phase": "ground",
                 "phase_selected_action": "repo.edit",
                 "fallback_from": "repo.edit",
-                "repair_ir": {"target_path": "src/lcfa/example.py"},
+                "repair_ir": {"target_path": target},
             },
         }
 
@@ -127,6 +141,36 @@ def test_phase_runtime_replaces_silent_search_fallback_with_target_read() -> Non
     controller = result["controller"]
     assert controller["mutation_recovery_attempted"] is True
     assert controller["mutation_recovery_status"] == "needs-target-evidence"
+    assert controller["mutation_target_pinned"] is True
     trace = policy.consume_controller_trace()
     assert len(trace) == 1
     assert trace[0]["repair_phase"] == "ground"
+
+
+def test_phase_runtime_keeps_target_pinned_when_pointer_drifts() -> None:
+    policy = PhaseMutationRuntimePolicy(_FakeInnerPolicy())
+    first = policy.choose("fix it", object(), (), 1)
+    assert first["action"]["inputs"]["path"] == "src/lcfa/example.py"
+
+    policy.observe(
+        first["action"],
+        {
+            "observations": {
+                "file": {
+                    "path": "src/lcfa/example.py",
+                    "text": "value = 1\n",
+                }
+            }
+        },
+        object(),
+    )
+
+    second = policy.choose("fix it", object(), (), 2)
+    controller = second["controller"]
+    assert controller["mutation_recovery_proposed_target"] == "src/lcfa/drifted.py"
+    assert controller["mutation_recovery_target"] == "src/lcfa/example.py"
+    assert controller["mutation_target_changed_by_pointer"] is True
+    assert second["action"] == {
+        "name": "repo.read",
+        "inputs": {"path": "src/lcfa/example.py"},
+    }
