@@ -58,6 +58,7 @@ lcfa-bench-card = "lcfa.bench_card:main"
 lcfa-latent = "lcfa.latent_cli:main"
 lcfa-semantic = "lcfa.semantic_cli:main"
 lcfa-recurrent = "lcfa.recurrent_cli:main"
+lcfa-hybrid = "lcfa.hybrid_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
