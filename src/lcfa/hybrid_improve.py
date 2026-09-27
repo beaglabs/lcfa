@@ -7,7 +7,7 @@ import shutil
 from typing import Any, Callable, Mapping
 
 from .hybrid_collect import collect_hybrid_trajectories
-from .hybrid_train import train_hybrid_controller
+from .hybrid_semantic_train import train_hybrid_controller
 from .recurrent_corrections import (
     prepare_corrective_transition_file,
     prepare_successful_rollout_transition_file,
@@ -50,7 +50,7 @@ def improve_hybrid_controller(
     argument_loss_weight: float = 0.5,
     max_argument_chars: int = 8192,
     latent_dim: int = 256,
-    latent_slots: int = 8,
+    latent_slots: int = 9,
     min_reasoning_steps: int = 2,
     max_reasoning_steps: int = 6,
     convergence_tolerance: float = 1e-3,
@@ -192,6 +192,7 @@ def improve_hybrid_controller(
                 for key in (
                     "backbone_mode", "init_controller", "init_head_tensors_loaded",
                     "init_hybrid_tensors_loaded", "init_backbone_loaded",
+                    "semantic_pointer_init_tensors_loaded", "semantic_pointer_examples",
                     "train_action_accuracy", "train_pointer_accuracy",
                     "validation_action_accuracy", "validation_pointer_accuracy",
                     "validation_exact_episode_accuracy", "argument_examples",
