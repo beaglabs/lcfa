@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from .hybrid_collect import collect_hybrid_trajectories
 from .hybrid_improve import improve_hybrid_controller
-from .hybrid_semantic_train import BACKBONE_MODES, TRAINING_SCOPES, train_hybrid_controller
+from .hybrid_train_dispatch import BACKBONE_MODES, TRAINING_SCOPES, train_hybrid_controller
 from .recurrent_corrections import prepare_corrective_transition_file
 from .recurrent_transitions import merge_transition_files, prepare_transition_file
 from .rwkv_controller import DEFAULT_RWKV_MODEL
@@ -50,7 +50,7 @@ def _training_args(parser: argparse.ArgumentParser, *, model_default: bool = Tru
         default="joint",
         help=(
             "pointer-only freezes RWKV, latent workspace, and control heads and "
-            "trains only the retrieval-prior semantic reranker"
+            "trains the fresh pairwise retrieval-prior semantic reranker"
         ),
     )
     parser.add_argument("--backbone-learning-rate", type=float, default=5e-6)
