@@ -2,7 +2,7 @@
 
 The learned phase controller may correctly select a mutation while the narrow
 RepairIR renderer fails because recurrent controller events intentionally omit
-large source blobs.  This module keeps those concerns separate: recurrent state
+large source blobs. This module keeps those concerns separate: recurrent state
 continues to see the compact event schema, while the mutation compiler receives
 bounded source text captured from actual ``repo.read`` observations.
 """
@@ -148,6 +148,7 @@ class PhaseMutationRuntimePolicy:
         self,
         *,
         goal: str,
+        solution: Any,
         controller: Mapping[str, Any],
         target_path: str,
     ) -> Mapping[str, Any] | None:
@@ -161,15 +162,26 @@ class PhaseMutationRuntimePolicy:
         if model is None or tokenizer is None or torch is None or device is None:
             return None
 
-        plan = {
-            key: controller.get(key)
-            for key in (
-                "task_intent",
-                "grounded_intent",
-                "repair_ir",
-                "repair_ir_validation",
+        pointer_raw = controller.get("pointer_index")
+        pointer = int(pointer_raw) if isinstance(pointer_raw, int) else None
+        repair_plan_fn = getattr(self.inner, "_repair_plan", None)
+        if callable(repair_plan_fn):
+            plan = repair_plan_fn(
+                action="repo.replace",
+                pointer=pointer,
+                solution=solution,
             )
-        }
+        else:
+            plan = {
+                key: controller.get(key)
+                for key in (
+                    "task_intent",
+                    "grounded_intent",
+                    "repair_ir",
+                    "repair_ir_validation",
+                )
+            }
+
         prompt = repair_prompt(
             "repo.replace",
             goal,
@@ -182,6 +194,7 @@ class PhaseMutationRuntimePolicy:
             "Return repo.replace inputs only. Copy `old` verbatim from this source, "
             "choose the smallest uniquely occurring span that can satisfy the user request, "
             "and make `new` the minimal corrected replacement. Do not rewrite the whole file.\n"
+            "Required JSON schema: {\"old\": \"exact source span\", \"new\": \"replacement\"}.\n"
             f"source_path={target_path}\n"
             f"source_text={source}\n"
         )
@@ -228,6 +241,7 @@ class PhaseMutationRuntimePolicy:
             controller["mutation_recovery_target"] = target_path
             recovered = self._recover_mutation(
                 goal=goal,
+                solution=solution,
                 controller=controller,
                 target_path=target_path,
             )
