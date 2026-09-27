@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from .hybrid_collect import collect_hybrid_trajectories
 from .hybrid_improve import improve_hybrid_controller
-from .hybrid_semantic_train import BACKBONE_MODES, train_hybrid_controller
+from .hybrid_semantic_train import BACKBONE_MODES, TRAINING_SCOPES, train_hybrid_controller
 from .recurrent_corrections import prepare_corrective_transition_file
 from .recurrent_transitions import merge_transition_files, prepare_transition_file
 from .rwkv_controller import DEFAULT_RWKV_MODEL
@@ -42,7 +42,16 @@ def _training_args(parser: argparse.ArgumentParser, *, model_default: bool = Tru
         "--backbone-mode",
         choices=BACKBONE_MODES,
         default="full",
-        help="full also trains the RWKV patch renderer; frozen trains latent/core heads only",
+        help="full also trains the RWKV patch renderer; frozen keeps RWKV fixed",
+    )
+    parser.add_argument(
+        "--training-scope",
+        choices=TRAINING_SCOPES,
+        default="joint",
+        help=(
+            "pointer-only freezes RWKV, latent workspace, and control heads and "
+            "trains only the retrieval-prior semantic reranker"
+        ),
     )
     parser.add_argument("--backbone-learning-rate", type=float, default=5e-6)
     parser.add_argument("--pointer-loss-weight", type=float, default=0.5)
@@ -122,12 +131,15 @@ def _progress(event: Mapping[str, Any]) -> None:
     elif kind == "epoch-done":
         pointer = event.get("pointer_accuracy")
         pointer_text = "n/a" if pointer is None else f"{float(pointer):.3f}"
+        prior = event.get("retrieval_prior_accuracy")
+        prior_text = "n/a" if prior is None else f"{float(prior):.3f}"
         print(
             "[lcfa-hybrid] "
             f"epoch={event.get('epoch')}/{event.get('epochs')} "
             f"loss={float(event.get('loss', 0.0)):.6f} "
             f"action={float(event.get('action_accuracy', 0.0)):.3f} "
-            f"pointer={pointer_text} stop={float(event.get('stop_accuracy', 0.0)):.3f} "
+            f"pointer={pointer_text} prior={prior_text} "
+            f"stop={float(event.get('stop_accuracy', 0.0)):.3f} "
             f"plan={event.get('plan_examples')} args={event.get('argument_examples')}",
             file=sys.stderr,
             flush=True,
@@ -159,6 +171,7 @@ def _train_kwargs(args: argparse.Namespace) -> Mapping[str, Any]:
         "validation_fraction": args.validation_fraction,
         "seed": args.seed,
         "backbone_mode": args.backbone_mode,
+        "training_scope": args.training_scope,
         "backbone_learning_rate": args.backbone_learning_rate,
         "pointer_loss_weight": args.pointer_loss_weight,
         "plan_loss_weight": args.plan_loss_weight,
