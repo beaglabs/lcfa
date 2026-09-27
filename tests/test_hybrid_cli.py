@@ -23,7 +23,7 @@ def test_hybrid_cli_exposes_train_rollout_and_improve() -> None:
     assert train.command == "train"
     assert train.init_controller == "old-controller"
     assert train.backbone_mode == "frozen"
-    assert train.latent_slots == 8
+    assert train.latent_slots == 9
 
     rollout = parser.parse_args([
         "rollout",
