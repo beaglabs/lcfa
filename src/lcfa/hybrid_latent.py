@@ -364,6 +364,12 @@ def make_hybrid_core(
                 nn.GELU(),
                 nn.Linear(self.hidden_size, self.hidden_size),
             )
+            # Baseline-preserving residual initialization: newly added latent
+            # cognition must not corrupt the feature geometry expected by a
+            # pretrained RWKV controller.  At initialization fused == source;
+            # the residual is learned only when supervised evidence supports it.
+            nn.init.zeros_(self.fusion[-1].weight)
+            nn.init.zeros_(self.fusion[-1].bias)
             self.plan = nn.Linear(self.latent_dim * 2, len(PLAN_FIELDS))
 
         def forward(self, hidden: Any, latent: Any | None = None) -> tuple[Any, Any, Any, int]:
@@ -399,7 +405,13 @@ def make_hybrid_core(
                 )
                 depth = index + 1
                 if depth >= self.min_reasoning_steps and self.convergence_tolerance > 0:
-                    delta = float((latent[:, 1:, :] - previous[:, 1:, :]).detach().abs().mean().item())
+                    delta = float(
+                        (latent[:, 1:, :] - previous[:, 1:, :])
+                        .detach()
+                        .abs()
+                        .mean()
+                        .item()
+                    )
                     if delta <= self.convergence_tolerance:
                         break
 
