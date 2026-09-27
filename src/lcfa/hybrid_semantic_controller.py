@@ -10,21 +10,26 @@ from .hybrid_latent import HYBRID_CONTROLLER_FORMAT, HybridLatentConfig
 from .protocol import SolutionState
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RecurrentDecision
 from .semantic_pointer import (
+    LEGACY_SEMANTIC_POINTER_FORMAT,
     SEMANTIC_POINTER_FORMAT,
     candidates_from_cognition,
+    encode_candidate_semantics,
+    make_legacy_semantic_pointer,
     make_semantic_pointer,
+    retrieval_prior_decision,
     semantic_pointer_decision,
 )
 
 
 class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
-    """Hybrid controller whose pointer is conditioned on actual visible candidates."""
+    """Hybrid controller reranking actual visible semantic candidates."""
 
     def __init__(
         self,
         model_id: str = DEFAULT_RWKV_MODEL,
         *,
         semantic_pointer_weights_path: str | Path,
+        pointer_format: str = SEMANTIC_POINTER_FORMAT,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_id, **kwargs)
@@ -33,22 +38,48 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("semantic pointer requires safetensors torch support") from exc
 
-        self.semantic_pointer = make_semantic_pointer(
-            self._torch,
-            hidden_size=self.hidden_size,
-            latent_dim=self.hybrid_config.latent_dim,
-            device=self.device,
-        )
+        self.pointer_format = str(pointer_format or LEGACY_SEMANTIC_POINTER_FORMAT)
+        if self.pointer_format == LEGACY_SEMANTIC_POINTER_FORMAT:
+            self.semantic_pointer = make_legacy_semantic_pointer(
+                self._torch,
+                hidden_size=self.hidden_size,
+                latent_dim=self.hybrid_config.latent_dim,
+                device=self.device,
+            )
+            architecture = "candidate-conditioned-semantic-v1"
+        else:
+            self.semantic_pointer = make_semantic_pointer(
+                self._torch,
+                hidden_size=self.hidden_size,
+                latent_dim=self.hybrid_config.latent_dim,
+                device=self.device,
+            )
+            architecture = "retrieval-prior+rwkv-semantic-residual"
         state = load_file(str(semantic_pointer_weights_path), device=self.device)
         self.semantic_pointer.load_state_dict(state, strict=True)
         self.semantic_pointer.eval()
         for parameter in self.semantic_pointer.parameters():
             parameter.requires_grad_(False)
+
         self._semantic_solution: SolutionState | None = None
+        self._candidate_embedding_cache: dict[str, Any] = {}
+        self._last_pointer_prior_index: int | None = None
+        self._last_pointer_prior_confidence: float | None = None
+        self._last_pointer_residual_gate: float | None = None
         self.metadata = {
             **self.metadata,
-            "pointer_architecture": "candidate-conditioned-semantic",
-            "pointer_format": SEMANTIC_POINTER_FORMAT,
+            "pointer_architecture": architecture,
+            "pointer_format": self.pointer_format,
+            "candidate_encoder": (
+                "frozen-rwkv-last-hidden-mean"
+                if self.pointer_format == SEMANTIC_POINTER_FORMAT
+                else "signed-hash-legacy"
+            ),
+            "pointer_prior": (
+                "deterministic-retrieval"
+                if self.pointer_format == SEMANTIC_POINTER_FORMAT
+                else None
+            ),
         }
 
     def decision(self) -> RecurrentDecision:
@@ -60,6 +91,30 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         candidates = candidates_from_cognition(base.action, cognition)
         if not candidates:
             return base
+
+        candidate_embeddings = None
+        if self.pointer_format == SEMANTIC_POINTER_FORMAT:
+            candidate_embeddings = encode_candidate_semantics(
+                self._torch,
+                self.model,
+                self.tokenizer,
+                candidates,
+                device=self.device,
+                cache=self._candidate_embedding_cache,
+            )
+            prior_index, prior_confidence, _ = retrieval_prior_decision(
+                self._torch,
+                candidates,
+                device=self.device,
+            )
+            self._last_pointer_prior_index = prior_index
+            self._last_pointer_prior_confidence = prior_confidence
+            gate = getattr(self.semantic_pointer, "residual_gate", None)
+            if gate is not None:
+                self._last_pointer_residual_gate = float(
+                    self._torch.tanh(gate.detach().float()).item()
+                )
+
         with self._torch.inference_mode():
             pointer_index, pointer_confidence, _ = semantic_pointer_decision(
                 self._torch,
@@ -67,6 +122,7 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                 self._hidden.float(),
                 self._latent,
                 candidates,
+                candidate_embeddings=candidate_embeddings,
             )
         if pointer_index is None:
             return base
@@ -85,6 +141,13 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         cognition = values.get("cognition")
         return cognition if isinstance(cognition, Mapping) else {}
 
+    def reset(self, goal: str, solution: SolutionState) -> None:
+        self._candidate_embedding_cache = {}
+        self._last_pointer_prior_index = None
+        self._last_pointer_prior_confidence = None
+        self._last_pointer_residual_gate = None
+        super().reset(goal, solution)
+
     def choose(self, goal: str, solution: SolutionState, recent: Any, step: int) -> Mapping[str, Any]:
         self._semantic_solution = solution
         try:
@@ -93,7 +156,10 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
             self._semantic_solution = None
         controller = result.get("controller") if isinstance(result, Mapping) else None
         if isinstance(controller, dict):
-            controller["pointer_architecture"] = "candidate-conditioned-semantic"
+            controller["pointer_architecture"] = self.metadata["pointer_architecture"]
+            controller["pointer_prior_index"] = self._last_pointer_prior_index
+            controller["pointer_prior_confidence"] = self._last_pointer_prior_confidence
+            controller["pointer_residual_gate"] = self._last_pointer_residual_gate
         return result
 
 
@@ -143,6 +209,7 @@ def load_hybrid_policy(
         heads_path=resolved_root / str(raw.get("weights") or "heads.safetensors"),
         hybrid_weights_path=resolved_root / str(raw.get("hybrid_weights") or "hybrid.safetensors"),
         semantic_pointer_weights_path=resolved_root / str(semantic_weights),
+        pointer_format=str(raw.get("pointer_format") or LEGACY_SEMANTIC_POINTER_FORMAT),
         backbone_weights_path=(resolved_root / str(backbone) if backbone else None),
         hybrid_config=config,
         device=device,

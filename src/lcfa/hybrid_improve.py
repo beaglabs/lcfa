@@ -44,6 +44,7 @@ def improve_hybrid_controller(
     validation_fraction: float = 0.2,
     seed: int = 20260925,
     backbone_mode: str = "frozen",
+    training_scope: str = "joint",
     backbone_learning_rate: float = 5e-6,
     pointer_loss_weight: float = 0.5,
     plan_loss_weight: float = 0.25,
@@ -152,6 +153,7 @@ def improve_hybrid_controller(
             validation_fraction=validation_fraction,
             seed=seed + round_index,
             backbone_mode=backbone_mode,
+            training_scope=training_scope,
             backbone_learning_rate=backbone_learning_rate,
             pointer_loss_weight=pointer_loss_weight,
             plan_loss_weight=plan_loss_weight,
@@ -190,9 +192,11 @@ def improve_hybrid_controller(
             "training": {
                 key: training.get(key)
                 for key in (
-                    "backbone_mode", "init_controller", "init_head_tensors_loaded",
-                    "init_hybrid_tensors_loaded", "init_backbone_loaded",
-                    "semantic_pointer_init_tensors_loaded", "semantic_pointer_examples",
+                    "backbone_mode", "training_scope", "init_controller",
+                    "init_head_tensors_loaded", "init_hybrid_tensors_loaded",
+                    "init_backbone_loaded", "semantic_pointer_init_tensors_loaded",
+                    "semantic_pointer_examples", "pointer_residual_gate",
+                    "train_retrieval_prior_accuracy", "validation_retrieval_prior_accuracy",
                     "train_action_accuracy", "train_pointer_accuracy",
                     "validation_action_accuracy", "validation_pointer_accuracy",
                     "validation_exact_episode_accuracy", "argument_examples",
