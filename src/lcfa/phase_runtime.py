@@ -250,7 +250,9 @@ class PhaseMutationRuntimePolicy:
             controller["mutation_recovery_attempted"] = True
             controller["mutation_recovery_proposed_target"] = proposed_target
             controller["mutation_recovery_target"] = target_path
+            controller["mutation_recovery_locked_target"] = target_path
             controller["mutation_target_pinned"] = True
+            controller["runtime_action_path_locked"] = True
             controller["mutation_target_changed_by_pointer"] = proposed_target != target_path
             recovered = self._recover_mutation(
                 goal=goal,
