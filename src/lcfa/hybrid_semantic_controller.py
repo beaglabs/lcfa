@@ -15,6 +15,12 @@ from .pairwise_pointer import (
     pairwise_semantic_pointer_decision,
 )
 from .protocol import SolutionState
+from .repair_phase import (
+    RepairPhaseState,
+    advance_repair_phase,
+    phase_action_policy,
+    stop_allowed,
+)
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RecurrentDecision
 from .semantic_pointer import (
     LEGACY_SEMANTIC_POINTER_FORMAT,
@@ -83,6 +89,10 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         self._last_pointer_residual_gate: float | None = None
         self._last_pointer_prior_strength: float | None = None
         self._last_pointer_residual_abs: float | None = None
+        self._repair_phase_state = RepairPhaseState()
+        self._last_phase_allowed_actions: tuple[str, ...] = ()
+        self._last_phase_raw_action: str | None = None
+        self._last_phase_selected_action: str | None = None
         semantic_formats = {SEMANTIC_POINTER_FORMAT, PAIRWISE_SEMANTIC_POINTER_FORMAT}
         self.metadata = {
             **self.metadata,
@@ -98,10 +108,58 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                 if self.pointer_format in semantic_formats
                 else None
             ),
+            "repair_phase_policy": "discover->ground->mutate->verify->done",
+            "premutation_verification_blocked": True,
+            "evidence_loop_hard_lock": 4,
         }
 
+    def _phase_constrained_base(self, base: RecurrentDecision) -> RecurrentDecision:
+        solution = self._semantic_solution
+        cognition = (
+            self._compact_solution_cognition(solution)
+            if solution is not None
+            else {}
+        )
+        has_target = bool(cognition.get("candidate_paths"))
+        allowed, biases = phase_action_policy(
+            self._repair_phase_state,
+            self.action_names,
+            has_target=has_target,
+        )
+        self._last_phase_allowed_actions = allowed
+        self._last_phase_raw_action = base.action
+
+        if self._hidden is None:
+            self._last_phase_selected_action = base.action
+            return base
+
+        with self._torch.inference_mode():
+            raw_logits = self.heads["action"](self._hidden.float())[0].float()
+            constrained = self._torch.full_like(raw_logits, float("-inf"))
+            allowed_set = set(allowed)
+            for index, name in enumerate(self.action_names):
+                if name in allowed_set:
+                    constrained[index] = raw_logits[index] + float(biases.get(name, 0.0))
+            if bool(self._torch.isneginf(constrained).all().item()):
+                constrained = raw_logits
+            probs = self._torch.softmax(constrained, dim=-1)
+            selected_index = int(self._torch.argmax(probs).item())
+            selected_action = self.action_names[selected_index]
+            selected_confidence = float(probs[selected_index].item())
+
+        self._last_phase_selected_action = selected_action
+        gated_stop = base.stop_probability if stop_allowed(self._repair_phase_state) else 0.0
+        return RecurrentDecision(
+            action=selected_action,
+            action_confidence=selected_confidence,
+            stop_probability=gated_stop,
+            value=base.value,
+            pointer_index=base.pointer_index,
+            pointer_confidence=base.pointer_confidence,
+        )
+
     def decision(self) -> RecurrentDecision:
-        base = super().decision()
+        base = self._phase_constrained_base(super().decision())
         solution = self._semantic_solution
         if solution is None or self._hidden is None or self._latent is None:
             return base
@@ -200,6 +258,10 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         self._last_pointer_residual_gate = None
         self._last_pointer_prior_strength = None
         self._last_pointer_residual_abs = None
+        self._repair_phase_state = RepairPhaseState()
+        self._last_phase_allowed_actions = ()
+        self._last_phase_raw_action = None
+        self._last_phase_selected_action = None
         super().reset(goal, solution)
 
     def choose(self, goal: str, solution: SolutionState, recent: Any, step: int) -> Mapping[str, Any]:
@@ -216,7 +278,30 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
             controller["pointer_residual_gate"] = self._last_pointer_residual_gate
             controller["pointer_prior_strength"] = self._last_pointer_prior_strength
             controller["pointer_residual_abs"] = self._last_pointer_residual_abs
+            controller["repair_phase"] = self._repair_phase_state.phase
+            controller["repair_phase_state"] = dict(self._repair_phase_state.to_dict())
+            controller["phase_allowed_actions"] = list(self._last_phase_allowed_actions)
+            controller["phase_raw_action"] = self._last_phase_raw_action
+            controller["phase_selected_action"] = self._last_phase_selected_action
+            controller["phase_overrode_action"] = (
+                self._last_phase_raw_action is not None
+                and self._last_phase_selected_action is not None
+                and self._last_phase_raw_action != self._last_phase_selected_action
+            )
         return result
+
+    def observe(
+        self,
+        action: Mapping[str, Any] | None,
+        observation: Mapping[str, Any],
+        solution: SolutionState,
+    ) -> None:
+        super().observe(action, observation, solution)
+        self._repair_phase_state = advance_repair_phase(
+            self._repair_phase_state,
+            action,
+            observation,
+        )
 
 
 def load_hybrid_policy(
