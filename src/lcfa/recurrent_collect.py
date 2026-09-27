@@ -319,6 +319,56 @@ def _oracle_action(
     }
 
 
+def _task_visible_repair_path(task: RecurrentCollectionTask, path: str) -> bool:
+    """Whether a repair path is exposed by task-visible goal/verifier evidence."""
+    visible = "\n".join([task.goal, *task.verify_argv]).lower()
+    candidate = Path(path)
+    signals = (
+        str(path).lower(),
+        candidate.name.lower(),
+        candidate.stem.lower(),
+        candidate.stem.replace("_", " ").lower(),
+    )
+    return any(signal and signal in visible for signal in signals)
+
+
+def _select_oracle_repair_targets(
+    task: RecurrentCollectionTask,
+    *,
+    worktree: Path,
+    repair_targets: Sequence[Any],
+    inspected_paths: Sequence[str],
+) -> tuple[Any, ...]:
+    """Keep gold edits only when localization did not depend on hidden gold."""
+    existing = tuple(
+        target for target in repair_targets if (worktree / target.path).is_file()
+    )
+    inspected = set(inspected_paths)
+    visible_paths = {
+        target.path
+        for target in existing
+        if _task_visible_repair_path(task, target.path)
+    }
+    missing_visible = sorted(visible_paths - inspected)
+    if missing_visible:
+        raise CollectionError(
+            "base-repository retriever missed task-visible repair file(s) within "
+            f"top {ORACLE_MAX_READS}: {missing_visible}"
+        )
+
+    selected = tuple(
+        target
+        for target in existing
+        if target.path in visible_paths or target.path in inspected
+    )
+    if not selected:
+        raise CollectionError(
+            "base-repository retriever did not independently surface any historical "
+            "repair target; refusing gold-path localization leakage"
+        )
+    return selected
+
+
 def _oracle_episode(
     task: RecurrentCollectionTask,
     *,
@@ -327,22 +377,19 @@ def _oracle_episode(
     base_commit: str,
     fix_commit: str,
 ) -> tuple[SemanticAgentEpisode, VerificationResult, Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
-    repair_targets = historical_repair_targets(source_repo, base_commit, fix_commit)
+    historical_targets = historical_repair_targets(source_repo, base_commit, fix_commit)
     db_path = worktree / ".lcfa" / "semantic.db"
     with SQLiteSemanticGraph(db_path) as graph:
         PythonRepoIndexer(graph, worktree).index()
         retrieval = build_retrieval_context(graph, task.goal)
 
-    existing_gold = {
-        target.path for target in repair_targets if (worktree / target.path).is_file()
-    }
     inspected_paths = retrieval.candidate_paths[:ORACLE_MAX_READS]
-    missing = sorted(existing_gold - set(inspected_paths))
-    if missing:
-        raise CollectionError(
-            "base-repository retriever missed historically changed file(s) within "
-            f"top {ORACLE_MAX_READS}: {missing}; refusing gold-path localization leakage"
-        )
+    repair_targets = _select_oracle_repair_targets(
+        task,
+        worktree=worktree,
+        repair_targets=historical_targets,
+        inspected_paths=inspected_paths,
+    )
 
     executor = LCFA(actions=register_workspace_actions()).agentic
     solution = SolutionState(

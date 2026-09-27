@@ -66,6 +66,25 @@ def _json_object(text: str) -> Mapping[str, Any] | None:
     return None
 
 
+def _valid_generated_inputs(action: str, inputs: Mapping[str, Any]) -> bool:
+    """Reject syntactically valid JSON that cannot satisfy an action contract."""
+    if action == "repo.replace":
+        return (
+            isinstance(inputs.get("path"), str)
+            and bool(str(inputs.get("path") or "").strip())
+            and isinstance(inputs.get("old"), str)
+            and bool(inputs.get("old"))
+            and isinstance(inputs.get("new"), str)
+        )
+    if action == "repo.edit":
+        return (
+            isinstance(inputs.get("path"), str)
+            and bool(str(inputs.get("path") or "").strip())
+            and isinstance(inputs.get("content"), str)
+        )
+    return True
+
+
 def _compact_cognition(solution: SolutionState) -> Mapping[str, Any]:
     raw = solution.values.get("cognition", {}) if isinstance(solution.values, Mapping) else {}
     if not isinstance(raw, Mapping):
@@ -368,6 +387,8 @@ class RWKVRecurrentPolicy:
         inputs = dict(parsed)
         if target_path and action in {"repo.replace", "repo.edit"}:
             inputs["path"] = target_path
+        if not _valid_generated_inputs(action, inputs):
+            return None
         return inputs
 
     def choose(
@@ -412,7 +433,7 @@ class RWKVRecurrentPolicy:
                 "controller": {
                     **controller,
                     "fallback_from": decision.action,
-                    "fallback_reason": "argument renderer returned no JSON object",
+                    "fallback_reason": "argument renderer returned invalid inputs",
                 },
             }
         return {
