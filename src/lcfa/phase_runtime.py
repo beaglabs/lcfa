@@ -116,11 +116,13 @@ class PhaseMutationRuntimePolicy:
         self.inner = inner
         self.metadata = {
             **dict(getattr(inner, "metadata", {})),
-            "phase_mutation_recovery": "grounded-source-repo.replace-v1",
+            "phase_mutation_recovery": "grounded-source-repo.replace-v2",
+            "mutation_target_lock": "first-phase-forced-grounded-target",
             "controller_trace_persisted": True,
         }
         self._file_evidence: dict[str, str] = {}
         self._controller_trace: list[Mapping[str, Any]] = []
+        self._mutation_target_pin: str | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
@@ -128,6 +130,7 @@ class PhaseMutationRuntimePolicy:
     def reset(self, goal: str, solution: Any) -> None:
         self._file_evidence = {}
         self._controller_trace = []
+        self._mutation_target_pin = None
         self.inner.reset(goal, solution)
 
     def observe(
@@ -138,6 +141,10 @@ class PhaseMutationRuntimePolicy:
     ) -> None:
         self._file_evidence.update(collect_file_evidence(observation))
         self.inner.observe(action, observation, solution)
+        name = str(action.get("name") or "") if isinstance(action, Mapping) else ""
+        if name in EDIT_ACTIONS:
+            # A mutation actually executed; verification/recovery owns the next target.
+            self._mutation_target_pin = None
 
     def consume_controller_trace(self) -> tuple[Mapping[str, Any], ...]:
         trace = tuple(dict(item) for item in self._controller_trace)
@@ -234,11 +241,17 @@ class PhaseMutationRuntimePolicy:
         controller = dict(controller_raw) if isinstance(controller_raw, Mapping) else {}
         fallback_from = str(controller.get("fallback_from") or "")
         selected = str(controller.get("phase_selected_action") or fallback_from)
-        target_path = controller_target_path(controller)
+        proposed_target = controller_target_path(controller)
 
-        if fallback_from in EDIT_ACTIONS and selected in EDIT_ACTIONS and target_path:
+        if fallback_from in EDIT_ACTIONS and selected in EDIT_ACTIONS and proposed_target:
+            if self._mutation_target_pin is None:
+                self._mutation_target_pin = proposed_target
+            target_path = self._mutation_target_pin
             controller["mutation_recovery_attempted"] = True
+            controller["mutation_recovery_proposed_target"] = proposed_target
             controller["mutation_recovery_target"] = target_path
+            controller["mutation_target_pinned"] = True
+            controller["mutation_target_changed_by_pointer"] = proposed_target != target_path
             recovered = self._recover_mutation(
                 goal=goal,
                 solution=solution,
@@ -253,9 +266,10 @@ class PhaseMutationRuntimePolicy:
                 controller.pop("fallback_from", None)
                 controller.pop("fallback_reason", None)
             else:
-                # Do not silently return to an unconstrained repository search.
-                # Re-read the already grounded target so the next forced mutation
-                # has authoritative source text available to the compiler.
+                # Keep the target stable while acquiring or refreshing the exact
+                # source text. Without this lock, every failed render can advance
+                # the pointer to another file and the compiler never gets a second
+                # attempt against the file it just requested.
                 result["action"] = {"name": "repo.read", "inputs": {"path": target_path}}
                 result["final"] = False
                 controller["mutation_recovery_status"] = (
@@ -265,7 +279,7 @@ class PhaseMutationRuntimePolicy:
                 )
                 controller["fallback_from"] = fallback_from
                 controller["fallback_reason"] = (
-                    "phase-forced mutation renderer failed; refreshing grounded target evidence"
+                    "phase-forced mutation renderer failed; keeping mutation target pinned"
                 )
 
         result["controller"] = controller
