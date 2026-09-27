@@ -53,6 +53,16 @@ class RWKVSemanticBackbone:
             return None
         return rendered
 
+    @classmethod
+    def _runtime_target_path(cls, controller: Mapping[str, Any]) -> str | None:
+        """Return an authoritative runtime-selected path that retrieval must not rewrite."""
+        if not bool(controller.get("mutation_target_pinned")):
+            return None
+        return cls._valid_path(
+            controller.get("mutation_recovery_target")
+            or controller.get("mutation_recovery_locked_target")
+        )
+
     def _paths_from_locations(self, cognition: Mapping[str, Any]) -> tuple[str, ...]:
         paths: list[str] = []
         for concept_id in self._sequence(cognition, "candidate_locations"):
@@ -244,6 +254,7 @@ class RWKVSemanticBackbone:
                 if isinstance(action.get("inputs"), Mapping)
                 else {}
             )
+            runtime_target = self._runtime_target_path(controller)
             if controller.get("fallback_from") == "repo.read":
                 name = "repo.read"
             if name == "repo.search":
@@ -252,22 +263,33 @@ class RWKVSemanticBackbone:
                     inputs["query"] = query
                     controller["retrieval_query"] = query
             elif name == "repo.read":
-                path = self._candidate_path(cognition, pointer, prefer_unread=True)
-                if path:
-                    inputs = {"path": path}
-                    self._read_paths.add(path)
-                    controller["retrieval_path"] = path
+                if runtime_target:
+                    inputs = {"path": runtime_target}
+                    self._read_paths.add(runtime_target)
+                    controller["retrieval_path"] = runtime_target
+                    controller["runtime_path_preserved"] = True
                 else:
-                    query = self._candidate_query(cognition, pointer) or goal
-                    name = "repo.search"
-                    inputs = {"query": query}
-                    controller["fallback_from"] = "repo.read"
-                    controller["fallback_reason"] = "no valid candidate file path"
+                    path = self._candidate_path(cognition, pointer, prefer_unread=True)
+                    if path:
+                        inputs = {"path": path}
+                        self._read_paths.add(path)
+                        controller["retrieval_path"] = path
+                    else:
+                        query = self._candidate_query(cognition, pointer) or goal
+                        name = "repo.search"
+                        inputs = {"query": query}
+                        controller["fallback_from"] = "repo.read"
+                        controller["fallback_reason"] = "no valid candidate file path"
             elif name in {"repo.replace", "repo.edit"}:
-                path = self._candidate_path(cognition, pointer)
-                if path:
-                    inputs["path"] = path
-                    controller["retrieval_path"] = path
+                if runtime_target:
+                    inputs["path"] = runtime_target
+                    controller["retrieval_path"] = runtime_target
+                    controller["runtime_path_preserved"] = True
+                else:
+                    path = self._candidate_path(cognition, pointer)
+                    if path:
+                        inputs["path"] = path
+                        controller["retrieval_path"] = path
             action = {"name": name, "inputs": inputs}
             choice["action"] = action
             choice["controller"] = controller
