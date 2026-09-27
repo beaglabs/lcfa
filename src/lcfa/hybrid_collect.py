@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .hybrid_semantic_controller import load_hybrid_policy
+from .phase_runtime import PhaseMutationRuntimePolicy, attach_controller_trace
 from .recurrent_collect import (
     COLLECTION_FORMAT,
     CollectionTaskResult,
@@ -47,11 +48,13 @@ def collect_hybrid_trajectories(
     controller_path = Path(controller).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     worktrees.mkdir(parents=True, exist_ok=True)
-    policy = load_hybrid_policy(
-        controller_path,
-        model_id=model_id,
-        device=device,
-        dtype=dtype,
+    policy = PhaseMutationRuntimePolicy(
+        load_hybrid_policy(
+            controller_path,
+            model_id=model_id,
+            device=device,
+            dtype=dtype,
+        )
     )
 
     results: list[CollectionTaskResult] = []
@@ -76,6 +79,9 @@ def collect_hybrid_trajectories(
             keep_worktrees=keep_worktrees,
             require_baseline_failure=require_baseline_failure,
         )
+        trace = policy.consume_controller_trace()
+        if result.episode_path and trace:
+            attach_controller_trace(result.episode_path, trace)
         results.append(result)
         if progress is not None:
             progress({
