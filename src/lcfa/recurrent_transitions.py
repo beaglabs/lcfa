@@ -31,11 +31,12 @@ except ImportError:  # pragma: no cover - exercised by detached historical verif
         return None
 
 
-RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v4"
+RECURRENT_TRANSITION_FORMAT = "lcfa.recurrent-transition.v5"
 LEGACY_RECURRENT_TRANSITION_FORMATS = (
     "lcfa.recurrent-transition.v1",
     "lcfa.recurrent-transition.v2",
     "lcfa.recurrent-transition.v3",
+    "lcfa.recurrent-transition.v4",
 )
 LEGACY_RECURRENT_TRANSITION_FORMAT = LEGACY_RECURRENT_TRANSITION_FORMATS[0]
 MAX_RECURRENT_TEXT_CHARS = 4096
@@ -74,6 +75,8 @@ class RecurrentTransition:
     candidate_queries: tuple[str, ...] = ()
     candidate_paths: tuple[str, ...] = ()
     candidate_entities: tuple[str, ...] = ()
+    candidate_scores: tuple[float, ...] = ()
+    candidate_evidence: tuple[tuple[str, ...], ...] = ()
     schema_version: str = RECURRENT_TRANSITION_FORMAT
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -221,6 +224,9 @@ def _retrieval_summary(value: Mapping[str, Any] | None) -> Mapping[str, Any] | N
     )
     if not queries and not paths and not entities:
         return None
+    # Scores/evidence are intentionally kept out of the recurrent event text.
+    # They supervise the pointer without perturbing the already-trained action
+    # controller's RWKV feature geometry.
     return {"queries": queries, "paths": paths, "entities": entities}
 
 
@@ -285,6 +291,14 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
     candidate_queries = retrieval.queries if retrieval is not None else ()
     candidate_paths = retrieval.candidate_paths if retrieval is not None else ()
     candidate_entities = retrieval.candidate_ids if retrieval is not None else ()
+    candidate_scores = (
+        tuple(float(candidate.score) for candidate in retrieval.candidates)
+        if retrieval is not None else ()
+    )
+    candidate_evidence = (
+        tuple(tuple(str(item) for item in candidate.evidence) for candidate in retrieval.candidates)
+        if retrieval is not None else ()
+    )
     value_target = _episode_success(episode)
     previous_action: Mapping[str, Any] | None = None
     previous_observation: Mapping[str, Any] = {}
@@ -328,6 +342,8 @@ def episode_to_transitions(episode: Mapping[str, Any]) -> tuple[RecurrentTransit
             candidate_queries=tuple(candidate_queries),
             candidate_paths=tuple(candidate_paths),
             candidate_entities=tuple(candidate_entities),
+            candidate_scores=candidate_scores,
+            candidate_evidence=candidate_evidence,
         ))
         previous_action = dict(action) if action else None
         previous_observation = dict(_mapping(step.get("observation")))
@@ -339,6 +355,32 @@ def load_episode(path: str | Path) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"episode must be a JSON object: {path}")
     return value
+
+
+def _float_tuple(value: Any) -> tuple[float, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return tuple(out)
+
+
+def _nested_text_tuple(value: Any) -> tuple[tuple[str, ...], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    rows: list[tuple[str, ...]] = []
+    for raw in value:
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            rows.append(tuple(str(item) for item in raw if str(item)))
+        elif raw:
+            rows.append((str(raw),))
+        else:
+            rows.append(())
+    return tuple(rows)
 
 
 def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
@@ -386,6 +428,8 @@ def load_transitions(path: str | Path) -> tuple[RecurrentTransition, ...]:
                     if isinstance(raw_entities, Sequence) and not isinstance(raw_entities, (str, bytes))
                     else ()
                 ),
+                candidate_scores=_float_tuple(raw.get("candidate_scores", ())),
+                candidate_evidence=_nested_text_tuple(raw.get("candidate_evidence", ())),
             ))
     return tuple(rows)
 
