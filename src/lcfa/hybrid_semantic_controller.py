@@ -7,6 +7,13 @@ from typing import Any, Mapping
 
 from .hybrid_controller import HybridLatentRWKVPolicy, load_hybrid_policy as load_legacy_hybrid_policy
 from .hybrid_latent import HYBRID_CONTROLLER_FORMAT, HybridLatentConfig
+from .pairwise_pointer import (
+    PAIRWISE_POINTER_ARCHITECTURE,
+    PAIRWISE_SEMANTIC_POINTER_FORMAT,
+    make_pairwise_semantic_pointer,
+    pairwise_pointer_prior_logits,
+    pairwise_semantic_pointer_decision,
+)
 from .protocol import SolutionState
 from .rwkv_controller import DEFAULT_RWKV_MODEL, RecurrentDecision
 from .semantic_pointer import (
@@ -47,6 +54,14 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                 device=self.device,
             )
             architecture = "candidate-conditioned-semantic-v1"
+        elif self.pointer_format == PAIRWISE_SEMANTIC_POINTER_FORMAT:
+            self.semantic_pointer = make_pairwise_semantic_pointer(
+                self._torch,
+                hidden_size=self.hidden_size,
+                latent_dim=self.hybrid_config.latent_dim,
+                device=self.device,
+            )
+            architecture = PAIRWISE_POINTER_ARCHITECTURE
         else:
             self.semantic_pointer = make_semantic_pointer(
                 self._torch,
@@ -66,18 +81,21 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         self._last_pointer_prior_index: int | None = None
         self._last_pointer_prior_confidence: float | None = None
         self._last_pointer_residual_gate: float | None = None
+        self._last_pointer_prior_strength: float | None = None
+        self._last_pointer_residual_abs: float | None = None
+        semantic_formats = {SEMANTIC_POINTER_FORMAT, PAIRWISE_SEMANTIC_POINTER_FORMAT}
         self.metadata = {
             **self.metadata,
             "pointer_architecture": architecture,
             "pointer_format": self.pointer_format,
             "candidate_encoder": (
                 "frozen-rwkv-last-hidden-mean"
-                if self.pointer_format == SEMANTIC_POINTER_FORMAT
+                if self.pointer_format in semantic_formats
                 else "signed-hash-legacy"
             ),
             "pointer_prior": (
                 "deterministic-retrieval"
-                if self.pointer_format == SEMANTIC_POINTER_FORMAT
+                if self.pointer_format in semantic_formats
                 else None
             ),
         }
@@ -93,7 +111,7 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
             return base
 
         candidate_embeddings = None
-        if self.pointer_format == SEMANTIC_POINTER_FORMAT:
+        if self.pointer_format in {SEMANTIC_POINTER_FORMAT, PAIRWISE_SEMANTIC_POINTER_FORMAT}:
             candidate_embeddings = encode_candidate_semantics(
                 self._torch,
                 self.model,
@@ -102,28 +120,62 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
                 device=self.device,
                 cache=self._candidate_embedding_cache,
             )
-            prior_index, prior_confidence, _ = retrieval_prior_decision(
-                self._torch,
-                candidates,
-                device=self.device,
-            )
-            self._last_pointer_prior_index = prior_index
-            self._last_pointer_prior_confidence = prior_confidence
-            gate = getattr(self.semantic_pointer, "residual_gate", None)
-            if gate is not None:
-                self._last_pointer_residual_gate = float(
-                    self._torch.tanh(gate.detach().float()).item()
+            if self.pointer_format == PAIRWISE_SEMANTIC_POINTER_FORMAT:
+                prior_logits = pairwise_pointer_prior_logits(
+                    self._torch,
+                    candidates,
+                    device=self.device,
                 )
+                prior_probs = self._torch.softmax(prior_logits.float(), dim=-1)
+                local_prior = int(self._torch.argmax(prior_probs).item())
+                self._last_pointer_prior_index = candidates[local_prior].index
+                self._last_pointer_prior_confidence = float(prior_probs[local_prior].item())
+                strength = getattr(self.semantic_pointer, "prior_strength", None)
+                if strength is not None:
+                    self._last_pointer_prior_strength = float(
+                        strength.detach().float().clamp(0.0, 2.0).item()
+                    )
+                with self._torch.inference_mode():
+                    _final, _prior, residual = self.semantic_pointer.components(
+                        self._hidden.float(),
+                        self._latent,
+                        candidates,
+                        candidate_embeddings,
+                    )
+                    self._last_pointer_residual_abs = float(residual.abs().mean().item())
+            else:
+                prior_index, prior_confidence, _ = retrieval_prior_decision(
+                    self._torch,
+                    candidates,
+                    device=self.device,
+                )
+                self._last_pointer_prior_index = prior_index
+                self._last_pointer_prior_confidence = prior_confidence
+                gate = getattr(self.semantic_pointer, "residual_gate", None)
+                if gate is not None:
+                    self._last_pointer_residual_gate = float(
+                        self._torch.tanh(gate.detach().float()).item()
+                    )
 
         with self._torch.inference_mode():
-            pointer_index, pointer_confidence, _ = semantic_pointer_decision(
-                self._torch,
-                self.semantic_pointer,
-                self._hidden.float(),
-                self._latent,
-                candidates,
-                candidate_embeddings=candidate_embeddings,
-            )
+            if self.pointer_format == PAIRWISE_SEMANTIC_POINTER_FORMAT:
+                pointer_index, pointer_confidence, _ = pairwise_semantic_pointer_decision(
+                    self._torch,
+                    self.semantic_pointer,
+                    self._hidden.float(),
+                    self._latent,
+                    candidates,
+                    candidate_embeddings=candidate_embeddings,
+                )
+            else:
+                pointer_index, pointer_confidence, _ = semantic_pointer_decision(
+                    self._torch,
+                    self.semantic_pointer,
+                    self._hidden.float(),
+                    self._latent,
+                    candidates,
+                    candidate_embeddings=candidate_embeddings,
+                )
         if pointer_index is None:
             return base
         return RecurrentDecision(
@@ -146,6 +198,8 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
         self._last_pointer_prior_index = None
         self._last_pointer_prior_confidence = None
         self._last_pointer_residual_gate = None
+        self._last_pointer_prior_strength = None
+        self._last_pointer_residual_abs = None
         super().reset(goal, solution)
 
     def choose(self, goal: str, solution: SolutionState, recent: Any, step: int) -> Mapping[str, Any]:
@@ -160,6 +214,8 @@ class SemanticPointerHybridPolicy(HybridLatentRWKVPolicy):
             controller["pointer_prior_index"] = self._last_pointer_prior_index
             controller["pointer_prior_confidence"] = self._last_pointer_prior_confidence
             controller["pointer_residual_gate"] = self._last_pointer_residual_gate
+            controller["pointer_prior_strength"] = self._last_pointer_prior_strength
+            controller["pointer_residual_abs"] = self._last_pointer_residual_abs
         return result
 
 
@@ -170,7 +226,7 @@ def load_hybrid_policy(
     device: str | None = "auto",
     dtype: str = "auto",
 ) -> HybridLatentRWKVPolicy:
-    """Load semantic-pointer artifacts, falling back to v2 legacy hybrid artifacts."""
+    """Load semantic-pointer artifacts, falling back to legacy hybrid artifacts."""
     root = Path(controller_dir)
     manifest_path = root / "controller.json" if root.is_dir() else root
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
