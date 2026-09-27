@@ -36,13 +36,16 @@ def train_hybrid_controller(
             progress=progress,
             **kwargs,
         )
+    joint_kwargs = dict(kwargs)
+    joint_kwargs.pop("pointer_margin", None)
+    joint_kwargs.pop("margin_loss_weight", None)
     return train_joint_hybrid_controller(
         transitions_path,
         output_dir,
         training_scope="joint",
         init_controller=init_controller,
         progress=progress,
-        **kwargs,
+        **joint_kwargs,
     )
 
 
